@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mayring-core"
+version = "0.1.0"
+description = "Shared core for MayringCoder: memory retrieval/ingestion, LLM routing, identity, Ollama client."
+requires-python = ">=3.10"
+# Core-only runtime deps — deliberately excludes API/agent deps
+# (fastapi, uvicorn, mcp, anthropic, gradio, …) so `pip install -e ./core`
+# stands up the shared library without the server stack.
+dependencies = [
+    "httpx",
+    "pyyaml",
+    "chromadb",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mayring_core*"]
