@@ -136,13 +136,21 @@ def touch_last_seen(conn: Any, device_id: str, workspace_id: str = "default") ->
 
 def list_devices(conn: Any, workspace_id: str) -> list[dict]:
     ensure_tables(conn)
-    rows = conn.execute(
-        """SELECT device_id, workspace_id, name, os, capabilities,
-                  last_seen, status, created_at
-           FROM devices WHERE workspace_id = ?
-           ORDER BY last_seen DESC""",
-        (workspace_id,),
-    ).fetchall()
+    # WHY(#274, observability): workspace_id == "system" (Service-Token) liefert
+    # cross-workspace — konsistent mit dashboard.py ("system sieht alles"). Die
+    # strikte per-workspace-Prüfung fürs Write-Routing bleibt in
+    # device_capabilities/effective_capabilities, NICHT hier (read-only Admin-View).
+    _cols = (
+        "SELECT device_id, workspace_id, name, os, capabilities, "
+        "last_seen, status, created_at FROM devices"
+    )
+    if workspace_id == "system":
+        rows = conn.execute(_cols + " ORDER BY last_seen DESC").fetchall()
+    else:
+        rows = conn.execute(
+            _cols + " WHERE workspace_id = ? ORDER BY last_seen DESC",
+            (workspace_id,),
+        ).fetchall()
     return [
         {
             "device_id": r[0],
@@ -229,20 +237,22 @@ def list_hook_events(
     conn: Any, workspace_id: str, since: str | None = None, limit: int = 200
 ) -> list[dict]:
     ensure_tables(conn)
+    # workspace_id == "system" (Service-Token) → cross-workspace (s. list_devices).
+    clauses: list[str] = []
+    params: list[Any] = []
+    if workspace_id != "system":
+        clauses.append("workspace_id = ?")
+        params.append(workspace_id)
     if since:
-        rows = conn.execute(
-            "SELECT id, workspace_id, device_id, hook_type, fired_at, payload "
-            "FROM hook_events WHERE workspace_id = ? AND fired_at > ? "
-            "ORDER BY fired_at DESC LIMIT ?",
-            (workspace_id, since, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, workspace_id, device_id, hook_type, fired_at, payload "
-            "FROM hook_events WHERE workspace_id = ? "
-            "ORDER BY fired_at DESC LIMIT ?",
-            (workspace_id, limit),
-        ).fetchall()
+        clauses.append("fired_at > ?")
+        params.append(since)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    rows = conn.execute(
+        "SELECT id, workspace_id, device_id, hook_type, fired_at, payload "
+        "FROM hook_events" + where + " ORDER BY fired_at DESC LIMIT ?",
+        params,
+    ).fetchall()
     out = []
     for r in rows:
         try:
