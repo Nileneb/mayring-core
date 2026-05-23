@@ -76,7 +76,10 @@ class MemoryIngestHandler(logging.Handler):
         api_url: str,
         token: str,
         service: str,
-        workspace_slug: str = "bene:logs",
+        # WHY(#workspace-uuid-sot): mayring-api-Infra-Logs sind ECHTE System-Logs,
+        # kein User-Content — gehören nach 'system' (Filament-Admin-Sicht), NICHT
+        # in den persönlichen Workspace (vorher 'bene:logs' → flutete Memory+Dashboard).
+        workspace_slug: str = "system",
         batch_size: int = 100,
         max_queue: int = 5000,
     ) -> None:
@@ -211,7 +214,7 @@ def configure_json_logging() -> None:
         api_url = os.environ.get("MAYRING_INTERNAL_API_URL",
                                  "http://localhost:8090")
         service = os.environ.get("MAYRING_SERVICE_NAME", "mayring-api")
-        workspace = os.environ.get("LOG_INGEST_TARGET_SLUG", "bene:logs")
+        workspace = os.environ.get("LOG_INGEST_TARGET_SLUG", "system")
         root.addHandler(MemoryIngestHandler(
             api_url=api_url, token=token, service=service,
             workspace_slug=workspace,
