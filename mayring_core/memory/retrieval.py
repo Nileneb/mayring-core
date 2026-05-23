@@ -21,7 +21,7 @@ _log = logging.getLogger(__name__)
 
 from mayring_core.memory.db_adapter import DBAdapter
 from mayring_core.memory.schema import Chunk, RetrievalRecord
-from mayring_core.memory.store import get_chunk, kv_get, get_feedback_score
+from mayring_core.memory.store import get_chunk, get_chunks_bulk, kv_get, get_feedback_score
 
 # ---------------------------------------------------------------------------
 # Query-Cache (in-process, invalidated on any memory mutation)
@@ -725,22 +725,23 @@ def search(
         opts["_vector_diag"] = "empty_after_scope_filter"
         return []
 
-    # Load candidate chunks (KV cache first, then SQLite)
+    # Load candidate chunks: KV cache first (fast in-mem hits), then ONE bulk
+    # SQLite query for the misses. WHY(#workspace-uuid-sot perf): the old per-cid
+    # get_chunk() loop did 4000+ single SQLite reads on a whole-workspace candidate
+    # set → ~11s/search → 9s hook timeouts. Bulk-load collapses that to one query.
     candidates: list[Chunk] = []
+    missing_ids: list[str] = []
     for cid in candidate_ids:
         cached = kv_get(cid)
         if cached is not None:
             try:
-                chunk = Chunk.from_dict(cached)
-                candidates.append(chunk)
+                candidates.append(Chunk.from_dict(cached))
                 continue
             except (KeyError, TypeError, ValueError):
-                # WHY(v2-stufe2.1): KV-Cache-Eintrag aus älterem Schema
-                # — fallthrough zu DB-Read; nicht silent für allg. Errors.
-                pass
-        chunk = get_chunk(conn, cid)
-        if chunk is not None:
-            candidates.append(chunk)
+                pass  # stale KV schema → reload from DB (bulk below)
+        missing_ids.append(cid)
+    if missing_ids:
+        candidates.extend(get_chunks_bulk(conn, missing_ids))
 
     if not candidates:
         return []

@@ -843,6 +843,30 @@ def get_chunk(conn: DBAdapter, chunk_id: str, active_only: bool = True) -> Chunk
     return Chunk.from_dict(dict(row))
 
 
+def get_chunks_bulk(
+    conn: DBAdapter, chunk_ids: list[str], active_only: bool = True
+) -> list[Chunk]:
+    """Load many chunks in ONE batched query instead of N single reads.
+
+    WHY(#workspace-uuid-sot perf): the retrieval candidate-load looped get_chunk()
+    per chunk_id — with a whole-workspace candidate set (4000+) that was ~11s of
+    SQLite roundtrips per search → hook timeouts. Bulk IN-query, batched to stay
+    under SQLite's variable limit (999)."""
+    if not chunk_ids:
+        return []
+    out: list[Chunk] = []
+    BATCH = 900
+    for i in range(0, len(chunk_ids), BATCH):
+        batch = chunk_ids[i:i + BATCH]
+        ph = ",".join("?" * len(batch))
+        q = f"SELECT * FROM chunks WHERE chunk_id IN ({ph})"
+        if active_only:
+            q += " AND is_active = 1"
+        rows = conn.execute(q, batch).fetchall()
+        out.extend(Chunk.from_dict(dict(r)) for r in rows)
+    return out
+
+
 def get_chunks_by_source(
     conn: DBAdapter, source_id: str, active_only: bool = True
 ) -> list[Chunk]:
