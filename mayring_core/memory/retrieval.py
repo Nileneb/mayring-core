@@ -868,12 +868,14 @@ def search(
     # Without the opt-out the auto-trigger >10 candidates would always fire.
     llm_scores: dict[str, float] = {}
     _llm_pref = opts.get("llm_prefilter")
-    if _llm_pref is False:
-        pass  # explicit opt-out — no advisor call
-    elif (_llm_pref or task_context or len(candidates) > 10) and ollama_url and candidates:
-        # WHY(#workspace-uuid-sot perf): only LLM-advise a top-N PRE-RANKED by the
-        # CHEAP symbolic+vector scores. Passing all 4k+ workspace candidates to the
-        # LLM cost 8-21s/search (→ 9s hook timeouts). Cap → one fast advisor call.
+    # WHY(#workspace-uuid-sot perf): the PI-advisor is now OPT-IN (llm_prefilter=True)
+    # only — it makes a CLOUD-LLM call (qwen-coder, 20% cloud-routed, 10-30s) that
+    # blew the 9s hook budget. The auto-trigger ">10 candidates OR task_context"
+    # fired on every real search (workspace = 4k+ chunks). Default search now relies
+    # on the fast symbolic+vector+feedback rerank; deep/recherche callers opt in.
+    if _llm_pref is True and ollama_url and candidates:
+        # Only LLM-advise a top-N pre-ranked by the cheap symbolic+vector scores —
+        # one bounded advisor call instead of scoring the whole workspace.
         ADVISOR_TOP_N = 30
         pre = sorted(
             candidates,
