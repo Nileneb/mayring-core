@@ -90,7 +90,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v9 (#workspace-uuid-sot v2.0 Phase 1): codebook-in-DB (codebooks,
 #       codebook_categories, codebook_proposals, chunk_categories) — Codebook aus
 #       YAML → SQLite, Category-Embeddings → Chroma-Collection "codebook_categories".
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 def _now_iso() -> str:
@@ -446,6 +446,9 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_projects_workspace
             ON projects(workspace_id);
+        -- Project Router (Slice 1): match by cwd-git-remote → source_ref.
+        CREATE INDEX IF NOT EXISTS idx_projects_source
+            ON projects(workspace_id, source_type, source_ref);
 
         -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
         -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
