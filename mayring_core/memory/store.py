@@ -81,7 +81,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v2 (#252): sources.scope_key column + index.
 #   v3 (task-tracker): tasks table + workspace/status/due indexes.
 #   v4 (todo-dedup): tasks.derive_embedding column for prompt-vs-prompt dedup.
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _now_iso() -> str:
@@ -294,6 +294,48 @@ def _migrate_visibility_check(conn: DBAdapter) -> None:
         logging.getLogger(__name__).warning(
             "visibility-check migration failed: %s — DB still on old constraint", exc
         )
+
+
+def _migrate_devices_composite_pk(conn: DBAdapter) -> None:
+    """Rebuild `devices` with PK (device_id, workspace_id) — migration v5→v6.
+
+    WHY(#274 review): v5 shipped `devices` with a sole `device_id` PK, but every
+    lookup is workspace-scoped, so a re-register in another workspace would
+    silently move the row (ON CONFLICT(device_id)). Composite PK lets the same
+    device_id coexist per workspace. SQLite can't ALTER a PK in place → rebuild.
+    Idempotent: short-circuits once the PK is already composite. Rows preserved
+    (old single-PK rows have unique device_id → no composite collision)."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "devices" not in tables:
+        return
+    # PRAGMA table_info row: (cid, name, type, notnull, dflt_value, pk).
+    pk_cols = {r[1] for r in conn.execute("PRAGMA table_info(devices)").fetchall()
+               if r[5] > 0}
+    if pk_cols == {"device_id", "workspace_id"}:
+        return  # already migrated
+    conn.executescript(
+        """
+        CREATE TABLE devices_v6 (
+            device_id    TEXT NOT NULL,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            name         TEXT NOT NULL DEFAULT '',
+            os           TEXT NOT NULL DEFAULT '',
+            capabilities TEXT NOT NULL DEFAULT '',
+            last_seen    TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'active',
+            created_at   TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (device_id, workspace_id)
+        );
+        INSERT INTO devices_v6
+            SELECT device_id, workspace_id, name, os, capabilities,
+                   last_seen, status, created_at FROM devices;
+        DROP TABLE devices;
+        ALTER TABLE devices_v6 RENAME TO devices;
+        CREATE INDEX IF NOT EXISTS idx_devices_workspace ON devices(workspace_id);
+        """
+    )
+    conn.commit()
 
 
 def _init_schema(conn: DBAdapter) -> None:
@@ -575,15 +617,20 @@ def _init_schema(conn: DBAdapter) -> None:
         -- "local-gpu,write"). Diese Tabelle ist die SoT für Write-Job-Routing:
         -- ein capability_required='write'-Job wird nur an ein hier mit 'write'
         -- registriertes Gerät zugewiesen (join pi_jobs.claimed_by ↔ device_id).
+        -- PK ist (device_id, workspace_id): dasselbe Gerät kann pro Workspace
+        -- eine eigene Registrierung haben, und ein re-register in workspace B
+        -- verschiebt NICHT stillschweigend die workspace-A-Zeile (alle Lookups
+        -- sind workspace-scoped). Migration v5→v6: _migrate_devices_composite_pk.
         CREATE TABLE IF NOT EXISTS devices (
-            device_id    TEXT PRIMARY KEY,
+            device_id    TEXT NOT NULL,
             workspace_id TEXT NOT NULL DEFAULT 'default',
             name         TEXT NOT NULL DEFAULT '',
             os           TEXT NOT NULL DEFAULT '',
             capabilities TEXT NOT NULL DEFAULT '',
             last_seen    TEXT NOT NULL DEFAULT '',
             status       TEXT NOT NULL DEFAULT 'active',
-            created_at   TEXT NOT NULL DEFAULT ''
+            created_at   TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (device_id, workspace_id)
         );
         CREATE INDEX IF NOT EXISTS idx_devices_workspace ON devices(workspace_id);
 
@@ -604,6 +651,9 @@ def _init_schema(conn: DBAdapter) -> None:
 
     # Migration: add missing columns to existing DBs
     _migrate_schema(conn)
+
+    # Migration v5→v6: devices PK device_id → (device_id, workspace_id) (#274 review)
+    _migrate_devices_composite_pk(conn)
 
     # Indexes for workspace_id filtering
     conn.execute(

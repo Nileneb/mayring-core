@@ -54,14 +54,15 @@ def ensure_tables(conn: Any) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS devices (
-            device_id    TEXT PRIMARY KEY,
+            device_id    TEXT NOT NULL,
             workspace_id TEXT NOT NULL DEFAULT 'default',
             name         TEXT NOT NULL DEFAULT '',
             os           TEXT NOT NULL DEFAULT '',
             capabilities TEXT NOT NULL DEFAULT '',
             last_seen    TEXT NOT NULL DEFAULT '',
             status       TEXT NOT NULL DEFAULT 'active',
-            created_at   TEXT NOT NULL DEFAULT ''
+            created_at   TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (device_id, workspace_id)
         );
         CREATE INDEX IF NOT EXISTS idx_devices_workspace
             ON devices(workspace_id);
@@ -103,8 +104,7 @@ def upsert_device(
         """INSERT INTO devices (device_id, workspace_id, name, os, capabilities,
                                 last_seen, status, created_at)
            VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-           ON CONFLICT(device_id) DO UPDATE SET
-               workspace_id = excluded.workspace_id,
+           ON CONFLICT(device_id, workspace_id) DO UPDATE SET
                name         = excluded.name,
                os           = excluded.os,
                capabilities = excluded.capabilities,
@@ -126,7 +126,7 @@ def touch_last_seen(conn: Any, device_id: str, workspace_id: str = "default") ->
         """INSERT INTO devices (device_id, workspace_id, name, os, capabilities,
                                 last_seen, status, created_at)
            VALUES (?, ?, '', '', '', ?, 'active', ?)
-           ON CONFLICT(device_id) DO UPDATE SET
+           ON CONFLICT(device_id, workspace_id) DO UPDATE SET
                last_seen = excluded.last_seen,
                status    = 'active'""",
         (device_id, workspace_id, now, now),
