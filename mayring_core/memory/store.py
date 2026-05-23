@@ -84,7 +84,10 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v7 (#workspace-uuid-sot): projects table + chunks/sources.project_id —
 #       Projekt-Trennung als Dimension UNTER dem einen Workspace (User-Diagramm),
 #       statt fake-separate workspace_ids.
-CURRENT_SCHEMA_VERSION = 7
+#   v8 (#workspace-uuid-sot): projects.{owner_id, source_type, source_ref} —
+#       Projekt-Diagramm: ein Projekt hat einen Owner + eine Source (github-Repo
+#       ODER papers/research). Goals↔Project (M:M, IGIO) = Backend-Designfrage offen.
+CURRENT_SCHEMA_VERSION = 8
 
 
 def _now_iso() -> str:
@@ -213,6 +216,12 @@ def _migrate_schema(conn: DBAdapter) -> None:
         ],
         "tasks": [
             ("derive_embedding", "TEXT"),
+        ],
+        # #workspace-uuid-sot v8 (User-Diagramm): Projekt-Metadaten.
+        "projects": [
+            ("owner_id", "TEXT"),
+            ("source_type", "TEXT"),
+            ("source_ref", "TEXT"),
         ],
     }
     existing_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -422,6 +431,13 @@ def _init_schema(conn: DBAdapter) -> None:
             id            TEXT PRIMARY KEY,
             workspace_id  TEXT NOT NULL,
             name          TEXT NOT NULL DEFAULT '',
+            -- #workspace-uuid-sot v8 (User-Diagramm): ein Projekt hat einen Owner
+            -- + eine Source (github-Repo ODER papers/research). owner_id =
+            -- app.linn.games user id; source_type ∈ {github, papers, research, …};
+            -- source_ref = Repo-URL / Paper-IDs / freie Referenz.
+            owner_id      TEXT,
+            source_type   TEXT,
+            source_ref    TEXT,
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
         );
