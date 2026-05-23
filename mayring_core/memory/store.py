@@ -81,7 +81,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v2 (#252): sources.scope_key column + index.
 #   v3 (task-tracker): tasks table + workspace/status/due indexes.
 #   v4 (todo-dedup): tasks.derive_embedding column for prompt-vs-prompt dedup.
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def _now_iso() -> str:
@@ -567,6 +567,39 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON tasks(workspace_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_due ON tasks(workspace_id, due_date);
+
+        -- #274: Device-Registry. Cloud-seitiges Gegenstück zum Plugin-Device-
+        -- Kanal (mayring-claude-plugin#5). Das Plugin/der Pi-Worker schickt eine
+        -- stabile device_id (X-Device-Id-Header); die Cloud persistiert hier
+        -- Gerät + Capabilities. `capabilities` ist comma-separated (z.B.
+        -- "local-gpu,write"). Diese Tabelle ist die SoT für Write-Job-Routing:
+        -- ein capability_required='write'-Job wird nur an ein hier mit 'write'
+        -- registriertes Gerät zugewiesen (join pi_jobs.claimed_by ↔ device_id).
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id    TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            name         TEXT NOT NULL DEFAULT '',
+            os           TEXT NOT NULL DEFAULT '',
+            capabilities TEXT NOT NULL DEFAULT '',
+            last_seen    TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'active',
+            created_at   TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_devices_workspace ON devices(workspace_id);
+
+        -- #274: Hook-Firings pro Gerät (Observability-Dashboard "Plugin").
+        -- best-effort insert vom Stop/UserPromptSubmit-Hook — payload ist ein
+        -- kleines JSON-summary, KEIN voller Transcript-Dump.
+        CREATE TABLE IF NOT EXISTS hook_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            device_id    TEXT NOT NULL DEFAULT '',
+            hook_type    TEXT NOT NULL DEFAULT '',
+            fired_at     TEXT NOT NULL DEFAULT '',
+            payload      TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_hook_events_ws_fired
+            ON hook_events(workspace_id, fired_at);
     """)
 
     # Migration: add missing columns to existing DBs
