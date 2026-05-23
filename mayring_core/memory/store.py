@@ -81,7 +81,10 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v2 (#252): sources.scope_key column + index.
 #   v3 (task-tracker): tasks table + workspace/status/due indexes.
 #   v4 (todo-dedup): tasks.derive_embedding column for prompt-vs-prompt dedup.
-CURRENT_SCHEMA_VERSION = 6
+#   v7 (#workspace-uuid-sot): projects table + chunks/sources.project_id —
+#       Projekt-Trennung als Dimension UNTER dem einen Workspace (User-Diagramm),
+#       statt fake-separate workspace_ids.
+CURRENT_SCHEMA_VERSION = 7
 
 
 def _now_iso() -> str:
@@ -140,9 +143,14 @@ def _migrate_schema(conn: DBAdapter) -> None:
             # "project:<uuid>" / "repo:<url>" / NULL=workspace-global. Existing
             # rows get NULL (they were workspace-global before this concept).
             ("scope_key", "TEXT DEFAULT NULL"),
+            # project_id (#workspace-uuid-sot, v7): FK→projects.id. The Project-ID
+            # dimension UNTER dem einen Workspace (User-Diagramm). NULL = kein
+            # Projekt (workspace-global). Ersetzt fake-separate workspace_ids.
+            ("project_id", "TEXT DEFAULT NULL"),
         ],
         "chunks": [
             ("workspace_id", "TEXT NOT NULL DEFAULT 'default'"),
+            ("project_id", "TEXT DEFAULT NULL"),
             ("category_source", "TEXT NOT NULL DEFAULT ''"),
             ("category_confidence", "REAL NOT NULL DEFAULT 0.0"),
             ("igio_axis", "TEXT NOT NULL DEFAULT ''"),
@@ -406,6 +414,19 @@ def _init_schema(conn: DBAdapter) -> None:
             ON chunks(dedup_key);
         CREATE INDEX IF NOT EXISTS idx_chunks_is_active
             ON chunks(is_active);
+
+        -- #workspace-uuid-sot (v7): Project = Sub-Dimension eines Workspace
+        -- (User-Diagramm: User → Workspace(UUID, owner) → Project(Project-ID)).
+        -- Ersetzt die alten fake-separaten Projekt-workspace_ids.
+        CREATE TABLE IF NOT EXISTS projects (
+            id            TEXT PRIMARY KEY,
+            workspace_id  TEXT NOT NULL,
+            name          TEXT NOT NULL DEFAULT '',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_projects_workspace
+            ON projects(workspace_id);
 
         CREATE TABLE IF NOT EXISTS chunk_feedback (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
