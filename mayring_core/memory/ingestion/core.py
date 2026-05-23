@@ -149,6 +149,11 @@ def ingest(
     # forschungsfrage; memory-hook: der derived task) geben das mit.
     # Empty → die prompts leiten das Thema aus dem chunk selbst ab.
     categorize_task: str = str(effective.get("task", "") or "")
+    # Phase 3.2 (project-scoped codebook): after chunks are embedded, link each
+    # to its closest active codebook category (deductive, LLM-free) → fills
+    # chunk_categories for the reranker. Scope = shared base ∪ this project's own.
+    link_project_id = effective.get("project_id") or None
+    do_link: bool = bool(effective.get("link_categories", True))
 
     from mayring_core.providers import embed_texts as _embed_texts
 
@@ -207,6 +212,7 @@ def ingest(
             )
 
         new_chunk_ids: list[str] = []
+        chunk_cat_embeddings: list[tuple[str, list[float]]] = []
         deduped_count = 0
         skipped_filter = 0
         indexed = False
@@ -260,6 +266,9 @@ def ingest(
                     _log.warning("chroma upsert failed for %s: %s",
                                  chunk.chunk_id[:12], exc)
 
+            if emb is not None:
+                chunk_cat_embeddings.append((chunk.chunk_id, emb))
+
             kv_put(chunk.chunk_id, chunk.to_dict())
             new_chunk_ids.append(chunk.chunk_id)
 
@@ -270,6 +279,24 @@ def ingest(
             {"chunks": len(new_chunk_ids), "deduped": deduped_count, "filtered": skipped_filter},
         )
 
+    # WHY(phase3.2): the deductive category-link runs OUTSIDE batch_context, on
+    # the already-committed chunks. A link failure (e.g. category Chroma cold)
+    # must never roll back the stored chunks — logged loud, never silenced.
+    category_links = 0
+    if do_link and chunk_cat_embeddings:
+        from mayring_core.memory.ingestion.mayring_process import link_chunks_deductive
+        from mayring_core.memory.store import get_chroma_collection
+        try:
+            category_links = link_chunks_deductive(
+                conn, get_chroma_collection("codebook_categories"),
+                chunk_cat_embeddings, project_id=link_project_id)
+            conn.commit()
+            _log.info("deductive category-link: %d/%d chunks linked (source=%s, project=%s)",
+                      category_links, len(chunk_cat_embeddings), source.source_id, link_project_id)
+        except Exception as exc:
+            _log.warning("deductive category-link failed (source=%s): %s",
+                         source.source_id, exc)
+
     result = {
         "source_id": source.source_id,
         "state": state,
@@ -278,6 +305,7 @@ def ingest(
         "deduped": deduped_count,
         "filtered": skipped_filter,
         "superseded": 0,
+        "category_links": category_links,
     }
 
     if do_log:

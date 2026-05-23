@@ -42,13 +42,22 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
 
-def _load_categories(conn: Any, codebook_id: int, statuses: tuple[str, ...]) -> list[dict]:
+def _load_categories(conn: Any, codebook_id: int, statuses: tuple[str, ...],
+                     project_id: str | None = None) -> list[dict]:
+    """Active category scope (project-scoped codebook, Phase 3.2): the shared
+    profile base (project_id IS NULL) ∪ the active project's own induced
+    categories (project_id = active). With no active project → base only, so a
+    session never sees another project's private categories."""
     placeholders = ",".join("?" for _ in statuses)
+    if project_id:
+        scope, extra = "AND (project_id IS NULL OR project_id = ?)", (project_id,)
+    else:
+        scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
         "SELECT id, name, igio_axis, parent_id, embedding_id, status, evidence_count "
         f"FROM codebook_categories WHERE codebook_id=? AND status IN ({placeholders}) "
-        "ORDER BY id",
-        (codebook_id, *statuses),
+        f"{scope} ORDER BY id",
+        (codebook_id, *statuses, *extra),
     ).fetchall()
     return [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
              "embedding_id": r[4], "status": r[5], "evidence_count": r[6]} for r in rows]
@@ -119,10 +128,51 @@ def _link_chunk(conn: Any, chunk_id: str, category_id: int, *,
         (chunk_id, category_id, version, confidence, source))
 
 
+def link_chunks_deductive(
+    conn: Any, chroma_categories: Any,
+    chunk_embeddings: list[tuple[str, list[float]]], *,
+    project_id: str | None = None,
+    min_score: float = _HYBRID_MIN, codebook_version: int = 1,
+) -> int:
+    """Cheap, LLM-free deductive linking for the bulk ingestion path.
+
+    Matches each chunk embedding against ALL active codebook categories
+    (cross-codebook — the embeddings route a chunk to its domain themselves, so
+    no fragile source_type→codebook_id mapping is needed) and writes a
+    chunk_categories row for the single best match >= min_score. NO proposals,
+    NO new categories, NO LLM — this keeps a 500-file populate fast and free of
+    proposal spam. The interactive /process path keeps the full mixed-method
+    flow. Returns the number of links written. Fail-soft: empty category set or
+    missing chroma → 0 (logs nothing, ingestion proceeds)."""
+    if project_id:
+        scope, extra = "AND (project_id IS NULL OR project_id = ?)", (project_id,)
+    else:
+        scope, extra = "AND project_id IS NULL", ()
+    rows = conn.execute(
+        "SELECT id, name, igio_axis, parent_id, embedding_id FROM codebook_categories "
+        f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
+    cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
+             "embedding_id": r[4]} for r in rows]
+    pairs = _category_embeddings(chroma_categories, cats)
+    if not pairs:
+        return 0
+    linked = 0
+    for chunk_id, emb in chunk_embeddings:
+        if emb is None or not len(emb):
+            continue
+        cat, score = _best_match(list(emb), pairs)
+        if cat is not None and score >= min_score:
+            _link_chunk(conn, chunk_id, cat["id"], version=codebook_version,
+                        confidence=score, source="deductive")
+            linked += 1
+    return linked
+
+
 def mayring_process(
     text: str, task: str, codebook_id: int, *,
     conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
     chunk_id: str | None = None, pi_job_id: str = "", codebook_version: int = 1,
+    active_project_id: str | None = None,
 ) -> ProcessResult:
     """Mixed-method, fail-closed categorization. Raises ValueError (→ HTTP 400)
     when text/task are empty or the codebook has no active categories — no silent
@@ -134,7 +184,7 @@ def mayring_process(
     if not (task or "").strip():
         raise ValueError("mayring_process: 'task' required (fail-closed)")
 
-    active = _load_categories(conn, codebook_id, ("active",))
+    active = _load_categories(conn, codebook_id, ("active",), active_project_id)
     if not active:
         raise ValueError(
             f"mayring_process: codebook {codebook_id} has no active categories (fail-closed)")
@@ -159,7 +209,7 @@ def mayring_process(
     if top_cat is not None and score >= _HYBRID_MIN:
         record_proposal(conn, codebook_id, top_cat["name"], paraphrase=text[:200],
                         parent_hint_id=top_cat["parent_id"], igio_axis=top_cat["igio_axis"],
-                        pi_job_id=pi_job_id, chunk_id=chunk_id)
+                        pi_job_id=pi_job_id, chunk_id=chunk_id, project_id=active_project_id)
         if chunk_id:
             _link_chunk(conn, chunk_id, top_cat["id"], version=codebook_version,
                         confidence=score, source="hybrid-merge")
@@ -185,7 +235,7 @@ def mayring_process(
     label_emb = embed_fn(label)
 
     # Embedding-Dedup: cosine > 0.92 zu existierender (aktiv ODER proposed) → Evidenz statt Neu
-    all_cats = _load_categories(conn, codebook_id, ("active", "proposed"))
+    all_cats = _load_categories(conn, codebook_id, ("active", "proposed"), active_project_id)
     dedup_cat, dedup_score = _best_match(label_emb, _category_embeddings(chroma_categories, all_cats))
     if dedup_cat is not None and dedup_score > _DEDUP_MIN:
         conn.execute("UPDATE codebook_categories SET evidence_count = evidence_count + 1 "
@@ -199,7 +249,8 @@ def mayring_process(
 
     cat_id = record_proposal(conn, codebook_id, label, paraphrase=text[:200],
                              parent_hint_id=parent_hint_id, igio_axis=igio,
-                             pi_job_id=pi_job_id, chunk_id=chunk_id)
+                             pi_job_id=pi_job_id, chunk_id=chunk_id,
+                             project_id=active_project_id)
     # Embedding für künftige Dedup-Runden hinterlegen (Dedup-fix gegenüber leerem embedding_id)
     emb_id = f"cb:proposed:{cat_id}"
     if chroma_categories is not None and label_emb:

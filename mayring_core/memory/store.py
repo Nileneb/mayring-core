@@ -90,7 +90,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v9 (#workspace-uuid-sot v2.0 Phase 1): codebook-in-DB (codebooks,
 #       codebook_categories, codebook_proposals, chunk_categories) — Codebook aus
 #       YAML → SQLite, Category-Embeddings → Chroma-Collection "codebook_categories".
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 
 
 def _now_iso() -> str:
@@ -225,6 +225,12 @@ def _migrate_schema(conn: DBAdapter) -> None:
             ("owner_id", "TEXT"),
             ("source_type", "TEXT"),
             ("source_ref", "TEXT"),
+        ],
+        # v2 Phase 3.2 (project-scoped codebook): NULL = geteilte Profil-Basis
+        # (imported), gesetzt = projekt-spezifisch induziert. Der aktive
+        # Kategorien-Satz einer Session = Basis ∪ active_project.categories.
+        "codebook_categories": [
+            ("project_id", "TEXT DEFAULT NULL"),
         ],
     }
     existing_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -481,6 +487,7 @@ def _init_schema(conn: DBAdapter) -> None:
             languages       TEXT NOT NULL DEFAULT '[]',
             patterns        TEXT NOT NULL DEFAULT '[]',
             promoted_at     TEXT,
+            project_id      TEXT DEFAULT NULL,
             UNIQUE (codebook_id, name)
         );
         CREATE INDEX IF NOT EXISTS idx_codebook_cat_codebook
