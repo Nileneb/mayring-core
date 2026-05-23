@@ -87,7 +87,10 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v8 (#workspace-uuid-sot): projects.{owner_id, source_type, source_ref} —
 #       Projekt-Diagramm: ein Projekt hat einen Owner + eine Source (github-Repo
 #       ODER papers/research). Goals↔Project (M:M, IGIO) = Backend-Designfrage offen.
-CURRENT_SCHEMA_VERSION = 8
+#   v9 (#workspace-uuid-sot v2.0 Phase 1): codebook-in-DB (codebooks,
+#       codebook_categories, codebook_proposals, chunk_categories) — Codebook aus
+#       YAML → SQLite, Category-Embeddings → Chroma-Collection "codebook_categories".
+CURRENT_SCHEMA_VERSION = 9
 
 
 def _now_iso() -> str:
@@ -443,6 +446,65 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_projects_workspace
             ON projects(workspace_id);
+
+        -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
+        -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
+        -- (embedding_id = Chroma-Doc-ID), NICHT pgvector. Single-Workspace → kein
+        -- workspace_id auf den Codebook-Tabellen.
+        CREATE TABLE IF NOT EXISTS codebooks (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug                    TEXT UNIQUE NOT NULL,
+            description             TEXT NOT NULL DEFAULT '',
+            version                 INTEGER NOT NULL DEFAULT 1,
+            auto_promote_threshold  INTEGER NOT NULL DEFAULT 3,
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS codebook_categories (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            codebook_id     INTEGER NOT NULL REFERENCES codebooks(id) ON DELETE CASCADE,
+            name            TEXT NOT NULL,
+            igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
+            parent_id       INTEGER REFERENCES codebook_categories(id),
+            description     TEXT NOT NULL DEFAULT '',
+            examples        TEXT NOT NULL DEFAULT '[]',
+            status          TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','proposed','deprecated')),
+            source          TEXT NOT NULL DEFAULT 'imported'
+                            CHECK (source IN ('manual','induced','imported')),
+            evidence_count  INTEGER NOT NULL DEFAULT 0,
+            embedding_id    TEXT NOT NULL DEFAULT '',
+            risk_level      TEXT NOT NULL DEFAULT '',
+            languages       TEXT NOT NULL DEFAULT '[]',
+            patterns        TEXT NOT NULL DEFAULT '[]',
+            promoted_at     TEXT,
+            UNIQUE (codebook_id, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codebook_cat_codebook
+            ON codebook_categories(codebook_id, status);
+        CREATE TABLE IF NOT EXISTS codebook_proposals (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id     INTEGER NOT NULL REFERENCES codebook_categories(id) ON DELETE CASCADE,
+            pi_job_id       TEXT NOT NULL DEFAULT '',
+            chunk_id        TEXT,
+            paraphrase      TEXT NOT NULL DEFAULT '',
+            parent_hint_id  INTEGER REFERENCES codebook_categories(id),
+            proposed_at     TEXT NOT NULL,
+            reviewed_by     TEXT,
+            decision        TEXT CHECK (decision IN ('promote','merge','reject') OR decision IS NULL)
+        );
+        CREATE TABLE IF NOT EXISTS chunk_categories (
+            chunk_id          TEXT NOT NULL,
+            category_id       INTEGER NOT NULL REFERENCES codebook_categories(id),
+            codebook_version  INTEGER NOT NULL DEFAULT 1,
+            confidence        REAL NOT NULL DEFAULT 0.0,
+            source            TEXT NOT NULL DEFAULT 'deductive'
+                              CHECK (source IN ('deductive','inductive','hybrid-merge')),
+            span_start        INTEGER,
+            span_end          INTEGER,
+            PRIMARY KEY (chunk_id, category_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_cat_cat ON chunk_categories(category_id);
 
         CREATE TABLE IF NOT EXISTS chunk_feedback (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
