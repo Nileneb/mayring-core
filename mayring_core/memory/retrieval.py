@@ -871,14 +871,25 @@ def search(
     if _llm_pref is False:
         pass  # explicit opt-out — no advisor call
     elif (_llm_pref or task_context or len(candidates) > 10) and ollama_url and candidates:
+        # WHY(#workspace-uuid-sot perf): only LLM-advise a top-N PRE-RANKED by the
+        # CHEAP symbolic+vector scores. Passing all 4k+ workspace candidates to the
+        # LLM cost 8-21s/search (→ 9s hook timeouts). Cap → one fast advisor call.
+        ADVISOR_TOP_N = 30
+        pre = sorted(
+            candidates,
+            key=lambda c: symbolic_scores.get(c.chunk_id, 0.0)
+            + vector_scores.get(c.chunk_id, 0.0),
+            reverse=True,
+        )[:ADVISOR_TOP_N]
         llm_model = opts.get("llm_prefilter_model", "qwen2.5-coder:7b")
         llm_scores = _llm_relevance_scores(
-            query, candidates, ollama_url,
+            query, pre, ollama_url,
             model=llm_model,
             task_context=task_context,
         )
-        candidates.sort(key=lambda c: llm_scores.get(c.chunk_id, 0.5), reverse=True)
-        candidates = candidates[:max(top_k * 2, 6)]
+        candidates = sorted(
+            pre, key=lambda c: llm_scores.get(c.chunk_id, 0.5), reverse=True
+        )[:max(top_k * 2, 6)]
 
     # Build source_type lookup for session_compacted boost
     source_type_map: dict[str, str] = {}
