@@ -113,7 +113,10 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v9 (#workspace-uuid-sot v2.0 Phase 1): codebook-in-DB (codebooks,
 #       codebook_categories, codebook_proposals, chunk_categories) — Codebook aus
 #       YAML → SQLite, Category-Embeddings → Chroma-Collection "codebook_categories".
-CURRENT_SCHEMA_VERSION = 11
+#   v12 (smoke-fix): index on context_feedback_log.captured_at so the 24h
+#       COUNT in /stats/feedback-log is a range-scan, not a full table scan —
+#       lets that live-movement endpoint run UNcached (per-poll) without load.
+CURRENT_SCHEMA_VERSION = 12
 
 
 def _now_iso() -> str:
@@ -796,6 +799,11 @@ def _init_schema(conn: DBAdapter) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sources_scope_key ON sources(scope_key)"
+    )
+    # v12: range-scan the 24h injections COUNT in /stats/feedback-log.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_context_feedback_captured "
+        "ON context_feedback_log(captured_at)"
     )
 
     # System-Workspace seedet sich beim DB-init. Verwendet von Service-
