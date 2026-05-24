@@ -266,6 +266,11 @@ class RetrievalRecord:
     # (analog zu source_affinity) verrechnet — soll Recall-Erweiterung
     # sein, kein Hauptsignal.
     score_predicted_topic: float = 0.0
+    # Reranker-v3 (#270): 1.0 wenn der Chunk über chunk_categories an eine
+    # Kategorie der Query geknüpft ist (sonst 0.0). Geloggt → der tägliche
+    # v2-Trainer kann das Gewicht lernen (Phase B), nicht nur der
+    # deterministische Boost (Phase A).
+    score_cat_match: float = 0.0
     score_final: float = 0.0
     # Issue #185/#182 follow-up: rationale-edges aus wiki_v2 für diesen chunk.
     # Liste von dicts {target, context, why} — wird im compress_for_prompt
@@ -288,6 +293,7 @@ class RetrievalRecord:
             "score_feedback": round(self.score_feedback, 4),
             "score_llm": round(self.score_llm, 4),
             "score_predicted_topic": round(self.score_predicted_topic, 4),
+            "score_cat_match": round(self.score_cat_match, 4),
             "score_final": round(self.score_final, 4),
             "rationale_edges": self.rationale_edges,
             "reasons": self.reasons,

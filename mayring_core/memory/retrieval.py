@@ -645,6 +645,7 @@ def _rerank(
                 score_feedback=sf,
                 score_llm=sl,
                 score_predicted_topic=sp,
+                score_cat_match=scat_id,
                 score_final=score_final,
                 reasons=reasons,
                 source_id=chunk.source_id,
