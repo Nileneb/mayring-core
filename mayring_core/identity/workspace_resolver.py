@@ -49,9 +49,30 @@ class IdentityRequiredError(ValueError):
 # ad-hoc f"user-{sub}" string-builder, jwt-claim-derivation in
 # validate_jwt_token). Mehrere unfixed callsites = workspace=system-leaks.
 # Audit: docs/v2-master-audit.md W1.
+def _canonicalize_alias(conn, workspace_id: str) -> str:
+    """Map a workspace_id through workspace_aliases to its canonical target.
+
+    WHY(workspace-repoint 2026-05-24): nach dem Re-Point 019d6933→019e14d6 tragen
+    zirkulierende Tokens (hook.jwt, watcher) noch die alte UUID. Ohne diesen Lookup
+    läsen/schrieben sie auf die verwaiste 019d6933 (leer → Hooks finden nichts,
+    Straggler-Writes). Der Alias macht alte Tokens transparent gültig — genau
+    wofür workspace_aliases da ist. Fail-soft: kein conn / kein Treffer → unverändert.
+    """
+    if conn is None:
+        return workspace_id
+    try:
+        row = conn.execute(
+            "SELECT workspace_id FROM workspace_aliases WHERE alias = ?",
+            (workspace_id,)).fetchone()
+    except Exception:  # noqa: BLE001 — alias-Tabelle fehlt (alte DB) → kein Alias
+        return workspace_id
+    return row[0] if row else workspace_id
+
+
 def resolve_workspace_from_token(
     info: "TokenInfoLike",
     override_header: str | None = None,
+    conn=None,
 ) -> str:
     """ONLY function used to determine workspace_id for any request.
 
@@ -84,8 +105,8 @@ def resolve_workspace_from_token(
     if is_service_token and override_header:
         candidate = override_header.strip()
         if candidate:
-            return candidate
-    return workspace_id
+            return _canonicalize_alias(conn, candidate)
+    return _canonicalize_alias(conn, workspace_id)
 
 
 def email_to_slug(email: str) -> str:
