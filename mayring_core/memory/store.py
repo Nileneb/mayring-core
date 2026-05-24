@@ -116,7 +116,11 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #   v12 (smoke-fix): index on context_feedback_log.captured_at so the 24h
 #       COUNT in /stats/feedback-log is a range-scan, not a full table scan —
 #       lets that live-movement endpoint run UNcached (per-poll) without load.
-CURRENT_SCHEMA_VERSION = 12
+#   v13 (smoke-fix): index on ingestion_log.created_at so /stats/recent-ops
+#       (ORDER BY created_at DESC LIMIT) stays cheap UNcached — its 15s cache
+#       served stale on write-then-read (watcher_hook_fires saw the ingest only
+#       after the TTL; same class as the feedback-log fix).
+CURRENT_SCHEMA_VERSION = 13
 
 
 def _now_iso() -> str:
@@ -804,6 +808,11 @@ def _init_schema(conn: DBAdapter) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_context_feedback_captured "
         "ON context_feedback_log(captured_at)"
+    )
+    # v13: index recent-ops' ORDER BY created_at DESC LIMIT (uncached live feed).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ingestion_log_created "
+        "ON ingestion_log(created_at)"
     )
 
     # System-Workspace seedet sich beim DB-init. Verwendet von Service-
