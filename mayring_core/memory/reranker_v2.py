@@ -46,7 +46,9 @@ _log = logging.getLogger(__name__)
 # compatible with old v2 model files (weights for missing features are
 # treated as 0 so a 6-feature model still scores).
 _IGIO_AXES = ("issue", "goal", "intervention", "outcome", "unknown")
-_FEATURES = ("v", "s", "r", "a") + tuple(f"igio_{a}" for a in _IGIO_AXES)
+# cat_match (#270 reranker-v3): strukturierter category_id-Abgleich Query↔Kandidat.
+# Geloggt + vom täglichen Trainer gewichtet; backward-compat (fehlt im Modell → w=0).
+_FEATURES = ("v", "s", "r", "a") + tuple(f"igio_{a}" for a in _IGIO_AXES) + ("cat_match",)
 _LOCK = threading.Lock()
 _CACHED_MODEL: dict[str, Any] | None = None
 _CACHED_MTIME: float = 0.0

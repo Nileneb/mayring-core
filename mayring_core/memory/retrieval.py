@@ -360,6 +360,18 @@ def _source_affinity_score(chunk: Chunk, affinity_source_id: str | None) -> floa
     return 0.0
 
 
+def _has_table(conn: DBAdapter, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _category_id_match(query_cat_ids: set[int], chunk_cat_ids: set[int]) -> float:
+    """Reranker-v3 (#270): 1.0 wenn ein Kandidat über chunk_categories an eine
+    Kategorie geknüpft ist, die auch zur Query-Kategorie gehört — strukturierter
+    category_id-Abgleich statt fragilem Free-String-Match auf category_labels."""
+    return 1.0 if (query_cat_ids and chunk_cat_ids and (query_cat_ids & chunk_cat_ids)) else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Stage 4: Re-ranking
 # ---------------------------------------------------------------------------
@@ -466,6 +478,33 @@ def _rerank(
     _IGIO_INTENT_BOOST = 0.10
     igio_intent_axis = (igio_intent or "").lower().strip()
 
+    # Reranker-v3 (#270): strukturierter category_id-Match. Die category_hint-Strings
+    # → category_ids auflösen, dann gegen die chunk_categories-FKs der Kandidaten
+    # matchen. Kleiner deterministischer Boost im v1-Pfad (sofort + sicher, kein
+    # Modell-Risiko) PLUS als 'cat_match'-Feature für die gelernte v2-Reranking
+    # geloggt. Coverage wächst mit chunk_categories (deduktiver Link-Pass).
+    _CAT_MATCH_BOOST = 0.08
+    query_cat_ids: set[int] = set()
+    chunk_cat_map: dict[str, set[int]] = {}
+    # Feature ist optional: ohne die Codebook-Tabellen (Minimal-/Alt-DB) bleibt es
+    # inaktiv (explizite Precondition, kein stilles except).
+    if (cat_hint_set and candidates
+            and _has_table(conn, "codebook_categories")
+            and _has_table(conn, "chunk_categories")):
+        ph = ",".join("?" for _ in cat_hint_set)
+        query_cat_ids = {
+            r[0] for r in conn.execute(
+                f"SELECT id FROM codebook_categories WHERE lower(name) IN ({ph})",
+                tuple(cat_hint_set)).fetchall()
+        }
+        if query_cat_ids:
+            ids = [c.chunk_id for c in candidates]
+            qp = ",".join("?" for _ in ids)
+            for cid, cat_id in conn.execute(
+                    f"SELECT chunk_id, category_id FROM chunk_categories "
+                    f"WHERE chunk_id IN ({qp})", tuple(ids)).fetchall():
+                chunk_cat_map.setdefault(cid, set()).add(cat_id)
+
     for chunk in candidates:
         sv_raw = vector_scores.get(chunk.chunk_id, 0.0)         # for the record
         sv_eff = stretched_vec.get(chunk.chunk_id, 0.0)         # for ranking
@@ -501,6 +540,9 @@ def _rerank(
         if igio_intent_axis and (chunk.igio_axis or "").lower() == igio_intent_axis:
             si = 1.0
 
+        # Reranker-v3 structured category_id match (s. Setup oben).
+        scat_id = _category_id_match(query_cat_ids, chunk_cat_map.get(chunk.chunk_id, set()))
+
         # WHY(2026-05-11 user-feedback): "Reasons sollten HOCH gewertet
         # werden, wenn sie in der suche auftauchen — hier sind ZUSAMMEN-
         # HÄNGE beschrieben". Konvergenz-bonus: wenn ≥2 unabhängige
@@ -530,6 +572,7 @@ def _rerank(
             + _PRED_BOOST * sp
             + _CAT_HINT_BOOST * sc
             + _IGIO_INTENT_BOOST * si
+            + _CAT_MATCH_BOOST * scat_id
             + convergence_bonus
         )
 
@@ -557,6 +600,7 @@ def _rerank(
                      "sf": sf, "sl": sl}
             for a_label in ("issue", "goal", "intervention", "outcome", "unknown"):
                 stage[f"igio_{a_label}"] = 1.0 if axis == a_label else 0.0
+            stage["cat_match"] = scat_id   # reranker-v3 (#270): gelernt sobald geloggt
             score_final = score_v2(stage, rr_model)
         else:
             score_final = score_v1
