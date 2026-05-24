@@ -290,46 +290,97 @@ def detect_igio_intent(query: str) -> str | None:
 # Stage 3b: Optional LLM pre-filter
 # ---------------------------------------------------------------------------
 
+_ADVISOR_BATCH_MAX = 20
+_ADVISOR_TIMEOUT = 4.5        # per-call budget; fail-fast → cheap ranking
+_ADVISOR_KEEP_ALIVE = "30m"   # keep the advisor model resident (no cold-load)
+
+
+def _parse_score_map(raw: str) -> dict:
+    """Extract the first JSON object from an LLM response, tolerating code
+    fences / trailing prose (mistral sometimes appends an explanation).
+    Returns {} if nothing parses."""
+    if not raw:
+        return {}
+    s = raw.strip()
+    try:
+        obj = _json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        pass
+    m = re.search(r"\{.*\}", s, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        obj = _json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
 def _llm_relevance_scores(
     query: str,
     candidates: list[Chunk],
     ollama_url: str,
-    model: str = "qwen2.5-coder:7b",
-    timeout: float = 10.0,
+    model: str = "mistral:7b-instruct",
+    timeout: float = _ADVISOR_TIMEOUT,
     task_context: str | None = None,
 ) -> dict[str, float]:
-    """Best-effort: LLM rates relevance of each candidate for query.
-    Returns chunk_id → [0.0, 1.0]. Falls back to 0.5 on any error.
+    """Best-effort: ONE batched LLM call rates every candidate for the query.
 
-    If task_context is provided (e.g. plan/todo content), the PI-advisor sees
-    the broader task description and can judge relevance more accurately than
-    from the query alone.
+    Returns chunk_id → [0.0, 1.0] for the chunks the model scored. Chunks the
+    model omits are simply absent — the caller treats a missing score as 0.5.
+    Returns {} on any error/timeout so the search degrades to the cheap
+    symbolic+vector ranking instead of blocking on a slow/cold model.
+
+    If task_context is provided (e.g. plan/todo content), the advisor sees the
+    broader task description and judges relevance more accurately.
+
+    WHY(inject-timeout 2026-05-24): this was 20 SEQUENTIAL generate() calls
+    (one per candidate, num_predict=8). On a thinking model the 8-token cap
+    never closed </think> → empty response → every chunk silently scored 0.5
+    (advisor inert) AND ~20 warm calls ≈ 10s blew the 9s UserPromptSubmit
+    budget → inject timed out → zero chunks injected → no recall AND the Stop
+    hook had no inject-state to rate → zero auto-feedback. One batched,
+    kept-warm call rates all candidates in ~0.5s warm; max_retries=1 + a tight
+    timeout degrade to the cheap ranking instead of re-blowing the budget on
+    the (2,5,10s) retry ladder. Default model mistral:7b-instruct is
+    non-thinking (no </think> trap) and is already the Stop-hook judge model,
+    so a single resident model serves both.
     """
     from mayring_core.ollama_client import generate as _oll_gen
-    scores: dict[str, float] = {}
+    cands = [c for c in candidates[:_ADVISOR_BATCH_MAX] if (c.text or "").strip()]
+    if not cands:
+        return {}
     task_block = (
         f"Task context (what the user is working on):\n{task_context[:600]}\n\n"
         if task_context else ""
     )
-    for chunk in candidates[:20]:
-        prompt = (
-            f"{task_block}"
-            f"Query: {query}\n\n"
-            f"Memory chunk: {chunk.text[:300]}\n\n"
-            "How relevant is this chunk for the task above? "
-            "Rate 0.0–1.0. Answer ONLY with the number."
+    numbered = "\n".join(
+        f"[{i}] {(c.text or '')[:300].replace(chr(10), ' ')}"
+        for i, c in enumerate(cands)
+    )
+    prompt = (
+        f"{task_block}"
+        f"Query: {query}\n\n"
+        f"Memory chunks:\n{numbered}\n\n"
+        "Rate how relevant EACH chunk is to the query/task, 0.0–1.0. "
+        "Answer ONLY a JSON object mapping the chunk index to its score, "
+        'e.g. {"0": 0.9, "1": 0.2}.'
+    )
+    try:
+        raw = _oll_gen(
+            ollama_url, model, prompt,
+            stream=False, num_predict=256, timeout=timeout,
+            max_retries=1, keep_alive=_ADVISOR_KEEP_ALIVE,
         )
-        try:
-            raw = _oll_gen(
-                ollama_url, model, prompt,
-                stream=False, timeout=timeout, num_predict=8,
-            ).strip()
-            scores[chunk.chunk_id] = max(0.0, min(1.0, float(raw)))
-        except (ConnectionError, TimeoutError, OSError, ValueError):
-            # WHY(v2-stufe2.1): LLM-Advisor ist Best-Effort — fallback 0.5
-            # bedeutet "keine starke Aussage". Konkrete Fehlerklassen
-            # benannt; alles andere (z.B. AssertionError aus mock) muss laut.
-            scores[chunk.chunk_id] = 0.5
+    except (ConnectionError, TimeoutError, OSError, ValueError):
+        return {}
+    data = _parse_score_map(raw)
+    scores: dict[str, float] = {}
+    for i, c in enumerate(cands):
+        v = data.get(str(i), data.get(i))
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            scores[c.chunk_id] = max(0.0, min(1.0, float(v)))
     return scores
 
 
@@ -934,7 +985,7 @@ def search(
             + vector_scores.get(c.chunk_id, 0.0),
             reverse=True,
         )[:ADVISOR_TOP_N]
-        llm_model = opts.get("llm_prefilter_model", "qwen2.5-coder:7b")
+        llm_model = opts.get("llm_prefilter_model", "mistral:7b-instruct")
         llm_scores = _llm_relevance_scores(
             query, pre, ollama_url,
             model=llm_model,
