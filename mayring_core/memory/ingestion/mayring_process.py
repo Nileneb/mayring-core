@@ -168,6 +168,58 @@ def link_chunks_deductive(
     return linked
 
 
+# Query-side category derivation (Reranker-v3 cat_match). Cache the active
+# category embeddings so the hot search path never fetches them from Chroma per
+# query — categories change only when the codebook is (re-)processed.
+_CAT_EMB_CACHE: dict[str, tuple[float, list]] = {}
+_CAT_EMB_TTL = 300.0
+
+
+def _active_category_pairs(conn: Any, chroma_categories: Any,
+                           project_id: str | None) -> list[tuple[dict, list[float]]]:
+    import time as _t
+    key = project_id or "__base__"
+    now = _t.monotonic()
+    hit = _CAT_EMB_CACHE.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    if project_id:
+        scope, extra = "AND (project_id IS NULL OR project_id = ?)", (project_id,)
+    else:
+        scope, extra = "AND project_id IS NULL", ()
+    rows = conn.execute(
+        "SELECT id, name, igio_axis, parent_id, embedding_id FROM codebook_categories "
+        f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
+    cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
+             "embedding_id": r[4]} for r in rows]
+    pairs = _category_embeddings(chroma_categories, cats)
+    _CAT_EMB_CACHE[key] = (now + _CAT_EMB_TTL, pairs)
+    return pairs
+
+
+def derive_query_category_ids(
+    conn: Any, chroma_categories: Any, query_emb: list[float], *,
+    project_id: str | None = None, min_score: float = _HYBRID_MIN, top_n: int = 3,
+) -> set[int]:
+    """Query-side mirror of link_chunks_deductive: map the query embedding to the
+    codebook category_ids it most likely belongs to (cosine >= min_score, up to
+    top_n). The reranker's cat_match needs the QUERY's categories too — without
+    this only callers that pass category_hint get cat_match, so the session-hook
+    path (which doesn't) left reranker-v3 inert even after chunk_categories was
+    populated by the deductive ingest link. Cheap: 1 query emb x N cached category
+    embeddings. Fail-soft → empty set (no Chroma / no categories)."""
+    if not query_emb:
+        return set()
+    pairs = _active_category_pairs(conn, chroma_categories, project_id)
+    if not pairs:
+        return set()
+    scored = sorted(
+        ((_cosine(query_emb, emb), cat["id"]) for cat, emb in pairs),
+        key=lambda t: t[0], reverse=True,
+    )
+    return {cid for s, cid in scored[:top_n] if s >= min_score}
+
+
 def mayring_process(
     text: str, task: str, codebook_id: int, *,
     conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,

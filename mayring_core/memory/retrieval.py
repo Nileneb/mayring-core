@@ -392,6 +392,7 @@ def _rerank(
     category_hint: list[str] | None = None,
     igio_intent: str | None = None,
     task_id: str | None = None,
+    query_category_ids: set[int] | None = None,
 ) -> list[RetrievalRecord]:
     """Combine scores and return top_k RetrievalRecords sorted by score_final DESC.
 
@@ -484,19 +485,23 @@ def _rerank(
     # Modell-Risiko) PLUS als 'cat_match'-Feature für die gelernte v2-Reranking
     # geloggt. Coverage wächst mit chunk_categories (deduktiver Link-Pass).
     _CAT_MATCH_BOOST = 0.08
-    query_cat_ids: set[int] = set()
+    # query_category_ids (server-derived from the query embedding) wins; otherwise
+    # fall back to resolving the caller's category_hint names → ids. Either way
+    # cat_match = (query categories ∩ a candidate's chunk_categories).
+    query_cat_ids: set[int] = set(query_category_ids or ())
     chunk_cat_map: dict[str, set[int]] = {}
     # Feature ist optional: ohne die Codebook-Tabellen (Minimal-/Alt-DB) bleibt es
     # inaktiv (explizite Precondition, kein stilles except).
-    if (cat_hint_set and candidates
+    if (candidates
             and _has_table(conn, "codebook_categories")
             and _has_table(conn, "chunk_categories")):
-        ph = ",".join("?" for _ in cat_hint_set)
-        query_cat_ids = {
-            r[0] for r in conn.execute(
-                f"SELECT id FROM codebook_categories WHERE lower(name) IN ({ph})",
-                tuple(cat_hint_set)).fetchall()
-        }
+        if not query_cat_ids and cat_hint_set:
+            ph = ",".join("?" for _ in cat_hint_set)
+            query_cat_ids = {
+                r[0] for r in conn.execute(
+                    f"SELECT id FROM codebook_categories WHERE lower(name) IN ({ph})",
+                    tuple(cat_hint_set)).fetchall()
+            }
         if query_cat_ids:
             ids = [c.chunk_id for c in candidates]
             qp = ",".join("?" for _ in ids)
@@ -804,6 +809,7 @@ def search(
     # Stage 3: vector retrieval
     vector_scores: dict[str, float] = {}
     vector_diag: str = "ok"  # surfaces in opts so callers can see WHY 0.0 happened
+    query_emb: list[float] | None = None  # reused below for query-side cat_match
     if chroma_collection is None:
         vector_diag = "no_chroma_collection"
         _log.warning("vector stage skipped: chroma_collection is None (query=%r)", query[:60])
@@ -980,6 +986,23 @@ def search(
     igio_intent = opts.get("igio_intent") or detect_igio_intent(query)
     opts["_igio_intent"] = igio_intent  # für diagnostics
 
+    # Reranker-v3 (#270): derive the QUERY's codebook categories from its embedding
+    # so cat_match fires for EVERY search, not only when the caller passes
+    # category_hint (the session hook doesn't → cat_match was inert despite Phase
+    # 3.2 populating chunk_categories). Fail-soft: any miss leaves it empty (no
+    # behaviour change); category embeddings are cached off the per-search path.
+    query_category_ids: set[int] = set()
+    if query_emb is not None:
+        try:
+            from mayring_core.memory.ingestion.mayring_process import derive_query_category_ids
+            from mayring_core.memory.store import get_chroma_collection
+            query_category_ids = derive_query_category_ids(
+                conn, get_chroma_collection("codebook_categories"), query_emb,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            _log.warning("query-category derivation skipped: %s", exc)
+
     ranked = _rerank(
         candidates, vector_scores, symbolic_scores, top_k, conn,
         affinity_source_id,
@@ -992,6 +1015,7 @@ def search(
         category_hint=opts.get("category_hint"),
         igio_intent=igio_intent,
         task_id=opts.get("task_id"),
+        query_category_ids=query_category_ids,
     )
 
     # Enrich with cross-source refs (same text found in other sources).
