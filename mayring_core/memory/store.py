@@ -10,6 +10,7 @@ ChromaDB:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,11 +38,33 @@ def get_chroma_collection(
     The same (name, path) pair always returns the same object, preventing
     multiple PersistentClient instances pointing at the same directory.
     Returns None if chromadb is not installed.
+
+    WHY(api-concurrency-capacity): when ``MAYRING_CHROMA_HOST`` is set (prod
+    multi-worker), connect to a Chroma *server* via ``HttpClient`` instead of an
+    embedded ``PersistentClient``. The embedded client is not multi-process-safe
+    and blocks the ``uvicorn --workers`` fix (concurrent workers opening the same
+    files → corruption risk). The server serialises access internally, so N API
+    workers share one Chroma safely. ``path`` is ignored in server mode (the
+    server owns the persist dir); it still selects the dir for the embedded
+    fallback used by tests/standalone (``MAYRING_CHROMA_HOST`` unset).
     """
     try:
         import chromadb
     except ImportError:
         return None
+
+    host = os.getenv("MAYRING_CHROMA_HOST")
+    if host:
+        port = int(os.getenv("MAYRING_CHROMA_PORT", "8000"))
+        ckey = f"http://{host}:{port}"
+        if ckey not in _chroma_clients:
+            _chroma_clients[ckey] = chromadb.HttpClient(host=host, port=port)
+        key = f"{ckey}::{name}"
+        if key not in _chroma_collections:
+            _chroma_collections[key] = _chroma_clients[ckey].get_or_create_collection(name)
+        return _chroma_collections[key]
+
+    # back-compat (tests, standalone) — embedded PersistentClient
     chroma_path = str(path or CACHE_DIR / "memory_chroma")
     key = f"{chroma_path}::{name}"
     if key not in _chroma_collections:
