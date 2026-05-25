@@ -750,7 +750,11 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON tasks(workspace_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_due ON tasks(workspace_id, due_date);
-        CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(workspace_id, external_id);
+        -- NOTE(incident 2026-05-25): idx_tasks_external_id is created in the
+        -- version-gated v14 block below (after a defensive ALTER), NOT inline
+        -- here — on an EXISTING DB this CREATE TABLE is a no-op so external_id
+        -- isn't present yet, and an inline index on it aborted the whole
+        -- executescript ("no such column") → init raised → every request 500'd.
 
         -- #274: Device-Registry. Cloud-seitiges Gegenstück zum Plugin-Device-
         -- Kanal (mayring-claude-plugin#5). Das Plugin/der Pi-Worker schickt eine
@@ -817,7 +821,16 @@ def _init_schema(conn: DBAdapter) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ingestion_log_created "
         "ON ingestion_log(created_at)"
     )
-    # v14: tasks.external_id for idempotent agent-task capture (PostToolUse hook)
+    # v14: tasks.external_id for idempotent agent-task capture (PostToolUse hook).
+    # WHY(migration-order incident 2026-05-25): on an EXISTING (v13) DB the
+    # CREATE TABLE above is a no-op, so external_id isn't present here yet — the
+    # generic column-migration adds it elsewhere. Indexing it first raised
+    # "no such column: external_id", which aborted the WHOLE migration → prod
+    # stuck at v13 → init_memory_db raised → every get_conn 500'd (search down).
+    # Fresh-DB tests missed it (CREATE TABLE adds the column). Add it defensively
+    # right before indexing so this block is self-contained for both paths.
+    if "external_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}:
+        conn.execute("ALTER TABLE tasks ADD COLUMN external_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(workspace_id, external_id)"
     )
