@@ -1,12 +1,28 @@
 """Central configuration and token-budget constants."""
 
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-# config.py lives at core/mayring_core/config.py; repo root (holding cache/,
-# wiki/, prompts/, codebooks/) is three levels up (#267 — was two under src/).
-BASE_DIR = Path(__file__).parent.parent.parent
+
+def _resolve_base_dir() -> Path:
+    """Repo root of the consumer (MayringCoder) — the dir holding codebooks/,
+    prompts/, config/, wiki/. mayring_core is vendored at varying depths
+    (src/ → core/ → vendor/mayring-core/ across #267/#270); a fixed __file__
+    depth broke on every relocation. Anchor to marker dirs instead.
+    MAYRING_BASE_DIR overrides for standalone installs where these dirs are absent."""
+    env = os.getenv("MAYRING_BASE_DIR")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "codebooks").is_dir() and (parent / "prompts").is_dir():
+            return parent
+    return here.parent.parent.parent  # fallback: historical core/mayring_core/ layout
+
+
+BASE_DIR = _resolve_base_dir()
 CACHE_DIR = BASE_DIR / "cache"
 WIKI_DIR = BASE_DIR / "wiki"
 REPORTS_DIR = BASE_DIR / "reports"
@@ -36,11 +52,10 @@ EMBEDDING_MODEL = "nomic-embed-text"   # Ollama embedding model (offline)
 
 # Ollama
 OLLAMA_TIMEOUT = 240
-import os as _os
-OLLAMA_SSL_VERIFY: bool = _os.getenv("OLLAMA_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+OLLAMA_SSL_VERIFY: bool = os.getenv("OLLAMA_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
 
 # Overview-Job Wallclock-Budget in Sekunden (600 war zu klein für große Repos)
-ANALYSIS_TIME_BUDGET: int = int(_os.getenv("ANALYSIS_TIME_BUDGET", "3600"))
+ANALYSIS_TIME_BUDGET: int = int(os.getenv("ANALYSIS_TIME_BUDGET", "3600"))
 
 # gitingest content separator (48 "=" characters, per gitingest source)
 INGEST_SEPARATOR = "=" * 48

@@ -19,8 +19,9 @@ except ImportError:
     _HAS_YAML = False
 
 
-_PROMPTS_DIR: Path = Path(__file__).parent.parent.parent.parent.parent / "prompts"  # +1 (#267)
-_CODEBOOK_DIR: Path = Path(__file__).parent.parent.parent.parent.parent / "codebooks"  # +1 (#267)
+from mayring_core.config import BASE_DIR as _BASE_DIR  # depth-robust repo-root (#267/#270)
+_PROMPTS_DIR: Path = _BASE_DIR / "prompts"
+_CODEBOOK_DIR: Path = _BASE_DIR / "codebooks"
 
 def _is_plausible_neu_label(inner: str) -> bool:
     """Reject obvious gibberish from weak models (e.g. mistral:7b on PHP code).

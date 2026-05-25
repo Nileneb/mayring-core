@@ -22,7 +22,7 @@ try:
 except ImportError:
     _HAS_YAML = False
 
-_ROOT = Path(__file__).parent.parent.parent  # core/mayring_core/ -> repo root (#267)
+from mayring_core.config import BASE_DIR as _ROOT  # depth-robust repo-root resolution (#267/#270)
 _CONFIG_PATH = _ROOT / "config" / "model_routes.yaml"
 
 _DEFAULTS: dict[str, dict] = {
