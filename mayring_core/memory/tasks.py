@@ -27,6 +27,7 @@ _COLS = (
     "created_by",
     "linked_chunk_id",
     "scope_key",
+    "external_id",
     "created_at",
     "updated_at",
     "completed_at",
@@ -63,6 +64,7 @@ def create_task(
     created_by: str | None = None,
     linked_chunk_id: str | None = None,
     scope_key: str | None = None,
+    external_id: str | None = None,
 ) -> dict:
     if not title or not title.strip():
         raise ValueError("title must not be empty")
@@ -71,6 +73,23 @@ def create_task(
     if not is_valid_scope_key(scope_key):
         raise ValueError(f"invalid scope_key: {scope_key!r}")
 
+    # WHY(igio-todos): idempotent capture — a re-fired PostToolUse hook for the
+    # same harness task must update the existing row, not create a duplicate.
+    if external_id:
+        existing = conn.execute(
+            "SELECT task_id FROM tasks WHERE workspace_id=? AND external_id=?",
+            (workspace_id, external_id),
+        ).fetchone()
+        if existing is not None:
+            existing_id = existing[0]
+            conn.execute(
+                "UPDATE tasks SET title=?, description=?, priority=?, tags=?, updated_at=? "
+                "WHERE task_id=? AND workspace_id=?",
+                (title, description, priority, tags, _now(), existing_id, workspace_id),
+            )
+            conn.commit()
+            return get_task(conn, workspace_id, existing_id)  # type: ignore[return-value]
+
     task_id = "tsk_" + uuid.uuid4().hex[:16]
     now = _now()
     conn.execute(
@@ -78,13 +97,13 @@ def create_task(
         INSERT INTO tasks
             (task_id, workspace_id, title, description, status, priority,
              due_date, tags, created_by, linked_chunk_id, scope_key,
-             created_at, updated_at, completed_at)
-        VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+             external_id, created_at, updated_at, completed_at)
+        VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
         """,
         (
             task_id, workspace_id, title, description, priority,
             due_date, tags, created_by, linked_chunk_id, scope_key,
-            now, now,
+            external_id, now, now,
         ),
     )
     conn.commit()

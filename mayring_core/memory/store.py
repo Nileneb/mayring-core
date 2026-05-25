@@ -120,7 +120,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       (ORDER BY created_at DESC LIMIT) stays cheap UNcached — its 15s cache
 #       served stale on write-then-read (watcher_hook_fires saw the ingest only
 #       after the TTL; same class as the feedback-log fix).
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 def _now_iso() -> str:
@@ -249,6 +249,7 @@ def _migrate_schema(conn: DBAdapter) -> None:
         ],
         "tasks": [
             ("derive_embedding", "TEXT"),
+            ("external_id", "TEXT"),
         ],
         # #workspace-uuid-sot v8 (User-Diagramm): Projekt-Metadaten.
         "projects": [
@@ -742,12 +743,14 @@ def _init_schema(conn: DBAdapter) -> None:
             linked_chunk_id TEXT REFERENCES chunks(chunk_id) ON DELETE SET NULL,
             scope_key      TEXT,
             derive_embedding TEXT,
+            external_id    TEXT,
             created_at     TEXT NOT NULL,
             updated_at     TEXT NOT NULL,
             completed_at   TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_status ON tasks(workspace_id, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_workspace_due ON tasks(workspace_id, due_date);
+        CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(workspace_id, external_id);
 
         -- #274: Device-Registry. Cloud-seitiges Gegenstück zum Plugin-Device-
         -- Kanal (mayring-claude-plugin#5). Das Plugin/der Pi-Worker schickt eine
@@ -813,6 +816,10 @@ def _init_schema(conn: DBAdapter) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ingestion_log_created "
         "ON ingestion_log(created_at)"
+    )
+    # v14: tasks.external_id for idempotent agent-task capture (PostToolUse hook)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(workspace_id, external_id)"
     )
 
     # System-Workspace seedet sich beim DB-init. Verwendet von Service-
