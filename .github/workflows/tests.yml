@@ -1,0 +1,27 @@
+name: tests
+
+# Smoke-Gate für mayring-core (shared lib: memory, llm routing, identity,
+# ollama client). Kein eigener Test-Suite-Bestand — die Tests leben in
+# MayringCoder/tests/. Hier nur: installiert sich sauber + Top-Level-Import zieht.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: "mayring-core: import smoke"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e .
+      - run: python -c "import mayring_core"
