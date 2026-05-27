@@ -23,7 +23,27 @@ def _resolve_base_dir() -> Path:
 
 
 BASE_DIR = _resolve_base_dir()
-CACHE_DIR = BASE_DIR / "cache"
+
+
+def _resolve_cache_dir(base: Path) -> Path:
+    """Where memory.db / wiki_v2.db / chroma live.
+
+    MAYRING_CACHE_DIR overrides. In a Claude Code *plugin* install BASE_DIR sits
+    under .claude/plugins/ and is re-versioned + wiped on every `/plugin update`,
+    which orphans the DB and splits it from CLI/workflow runs. Persist at the user
+    level there so every client entrypoint (MCP server, CLI, ingest-workflows)
+    shares ONE DB. Server / dev clones keep the repo-relative cache — prod mounts
+    BASE_DIR/cache as a volume, so that path must not move."""
+    env = os.getenv("MAYRING_CACHE_DIR")
+    if env:
+        return Path(env)
+    parts = set(base.parts)
+    if ".claude" in parts and "plugins" in parts:
+        return Path.home() / ".cache" / "mayringcoder"
+    return base / "cache"
+
+
+CACHE_DIR = _resolve_cache_dir(BASE_DIR)
 WIKI_DIR = BASE_DIR / "wiki"
 REPORTS_DIR = BASE_DIR / "reports"
 PROMPTS_DIR = BASE_DIR / "prompts"
