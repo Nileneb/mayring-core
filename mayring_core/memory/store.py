@@ -483,9 +483,10 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_projects_workspace
             ON projects(workspace_id);
-        -- Project Router (Slice 1): match by cwd-git-remote → source_ref.
-        CREATE INDEX IF NOT EXISTS idx_projects_source
-            ON projects(workspace_id, source_type, source_ref);
+        -- NOTE: idx_projects_source (workspace_id, source_type, source_ref) is
+        -- created AFTER _migrate_schema() below — on a pre-v8 DB those columns
+        -- are back-filled there via ALTER, so an inline CREATE INDEX here crashed
+        -- legacy DBs with "no such column: source_type".
 
         -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
         -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
@@ -810,6 +811,13 @@ def _init_schema(conn: DBAdapter) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sources_scope_key ON sources(scope_key)"
+    )
+    # Project Router (Slice 1): match by cwd-git-remote → source_ref. Created
+    # here (not in the DDL block) because _migrate_schema back-fills projects'
+    # source_type/source_ref on pre-v8 DBs — same migration-order class as v14.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_projects_source "
+        "ON projects(workspace_id, source_type, source_ref)"
     )
     # v12: range-scan the 24h injections COUNT in /stats/feedback-log.
     conn.execute(
