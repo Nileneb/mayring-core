@@ -193,7 +193,15 @@ def _active_category_pairs(conn: Any, chroma_categories: Any,
     cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
              "embedding_id": r[4]} for r in rows]
     pairs = _category_embeddings(chroma_categories, cats)
-    _CAT_EMB_CACHE[key] = (now + _CAT_EMB_TTL, pairs)
+    # WHY(2026-05-28): do NOT negative-cache an empty result. The chroma
+    # codebook_categories collection is empty right after a deploy cutover and
+    # only repopulated by the post-deploy reembed; caching pairs=[] for the full
+    # TTL kept query→category derivation (→ reranker-v3 cat_match) DEAD for up to
+    # 300s AFTER the reembed → recurring red cat_match smoke (a reembed had no
+    # immediate effect). Only cache a non-empty result; an empty one is re-tried
+    # on the next call so a reembed takes effect immediately.
+    if pairs:
+        _CAT_EMB_CACHE[key] = (now + _CAT_EMB_TTL, pairs)
     return pairs
 
 
