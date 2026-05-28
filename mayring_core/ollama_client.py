@@ -156,6 +156,7 @@ def generate(
     num_predict: int = 4096,
     options: dict | None = None,
     keep_alive: str | None = None,
+    response_format: str | None = None,
 ) -> str:
     """POST to /api/generate and return the complete response text.
 
@@ -187,6 +188,13 @@ def generate(
     if options:
         merged_options.update(options)
     body["options"] = merged_options
+
+    # WHY(2026-05-28 central-queue): `format` (e.g. "json") is a TOP-LEVEL
+    # Ollama field, not an option — set before the cloud_body copy so JSON-mode
+    # holds on both the cloud-primary and local paths. Lets the queue-routed
+    # pi_* tools request structured output without a direct Ollama call.
+    if response_format:
+        body["format"] = response_format
 
     # WHY(2026-05-10 cloud-primary-routing): X% der calls direkt an cloud
     # (free-tier quota nutzen) — wenn cloud fail't, fallback auf local.
