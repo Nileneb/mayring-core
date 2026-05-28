@@ -31,7 +31,6 @@ from mayring_core.memory.chunker import structural_chunk
 from mayring_core.memory.ingestion.categorization import (
     _INGEST_DEFAULTS,
     _INGEST_DEFAULT_FALLBACK,
-    mayring_categorize,
 )
 from mayring_core.memory.ingestion.image import (
     _IMAGE_EXTENSIONS,
@@ -199,17 +198,13 @@ def ingest(
         else:
             chunks = structural_chunk(content, source.source_id, source.path)
 
-        if do_categorize and model:
-            chunks = mayring_categorize(
-                chunks, ollama_url, model,
-                mode=mode, codebook=codebook_choice,
-                source_type=source.source_type,
-                conn=conn,
-                router=router,
-                workspace_id=workspace_id,
-                task=categorize_task,
-                chroma_collection=chroma_collection,
-            )
+        # WHY(2026-05-29, category-consolidation): the LLM mayring_categorize pass
+        # is RETIRED here. Categorization is now the single cosine deductive link
+        # below (link_chunks_deductive, top_n=3) and the free-string
+        # category_labels are DERIVED from those FK links — one SoT
+        # (chunk_categories), no second parallel LLM-label system. The labels are
+        # back-written to the chunks after linking (insert stores them empty).
+        _ = (do_categorize, mode, codebook_choice, categorize_task)  # retired inputs
 
         new_chunk_ids: list[str] = []
         chunk_cat_embeddings: list[tuple[str, list[float]]] = []
@@ -289,10 +284,24 @@ def ingest(
         try:
             category_links = link_chunks_deductive(
                 conn, get_chroma_collection("codebook_categories"),
-                chunk_cat_embeddings, project_id=link_project_id)
+                chunk_cat_embeddings, project_id=link_project_id, top_n=3)
             conn.commit()
             _log.info("deductive category-link: %d/%d chunks linked (source=%s, project=%s)",
                       category_links, len(chunk_cat_embeddings), source.source_id, link_project_id)
+            # Back-write the legacy free-string category_labels DERIVED from the FK
+            # links (one SoT). insert_chunk stored them empty now that the LLM
+            # categorize pass is retired; the ~10 category_labels consumers (IGIO
+            # classifier, wiki-edges, recap, search display, paper_rules) keep
+            # working unchanged — same column, FK-sourced.
+            from mayring_core.memory.ingestion.mayring_process import derive_labels_from_categories
+            label_map = derive_labels_from_categories(conn, new_chunk_ids)
+            for cid, labels in label_map.items():
+                conn.execute(
+                    "UPDATE chunks SET category_labels = ?, category_source = 'deductive-link' "
+                    "WHERE chunk_id = ? AND is_active = 1",
+                    (",".join(labels[:5]), cid),
+                )
+            conn.commit()
         except Exception as exc:
             _log.warning("deductive category-link failed (source=%s): %s",
                          source.source_id, exc)

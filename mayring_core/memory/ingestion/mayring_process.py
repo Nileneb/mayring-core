@@ -98,6 +98,42 @@ def _best_match(query_emb: list[float],
     return best_cat, best_score
 
 
+def _best_matches(query_emb: list[float],
+                  pairs: list[tuple[dict, list[float]]], *,
+                  top_n: int, min_score: float) -> list[tuple[dict, float]]:
+    """Top-N categories by cosine, each >= min_score. Multi-label variant of
+    _best_match for the category-consolidation (one cosine pass → several FK
+    links, replacing the separate LLM multi-label categorize)."""
+    scored = sorted(
+        ((_cosine(query_emb, emb), cat) for cat, emb in pairs),
+        key=lambda t: t[0], reverse=True,
+    )
+    return [(cat, s) for s, cat in scored[:top_n] if s >= min_score]
+
+
+def derive_labels_from_categories(
+    conn: Any, chunk_ids: list[str],
+) -> dict[str, list[str]]:
+    """Derive the legacy free-string category_labels from the structured
+    chunk_categories FK (highest-confidence first). Lets consumers that read
+    chunks.category_labels keep working after the LLM mayring_categorize pass is
+    retired — one cosine SoT (chunk_categories), labels are a derived view."""
+    if not chunk_ids:
+        return {}
+    ph = ",".join("?" for _ in chunk_ids)
+    out: dict[str, list[str]] = {}
+    for cid, name in conn.execute(
+        "SELECT cc.chunk_id, cat.name FROM chunk_categories cc "
+        "JOIN codebook_categories cat ON cat.id = cc.category_id "
+        f"WHERE cc.chunk_id IN ({ph}) ORDER BY cc.confidence DESC",
+        tuple(chunk_ids),
+    ).fetchall():
+        labels = out.setdefault(cid, [])
+        if name and name not in labels:
+            labels.append(name)
+    return out
+
+
 def _infer_igio_axis(name: str) -> str | None:
     """Best-effort IGIO axis from the label until the importer backfills it
     (Phase 1 gap: igio_axis is NULL for all imported categories)."""
@@ -133,6 +169,7 @@ def link_chunks_deductive(
     chunk_embeddings: list[tuple[str, list[float]]], *,
     project_id: str | None = None,
     min_score: float = _HYBRID_MIN, codebook_version: int = 1,
+    top_n: int = 1,
 ) -> int:
     """Cheap, LLM-free deductive linking for the bulk ingestion path.
 
@@ -160,8 +197,12 @@ def link_chunks_deductive(
     for chunk_id, emb in chunk_embeddings:
         if emb is None or not len(emb):
             continue
-        cat, score = _best_match(list(emb), pairs)
-        if cat is not None and score >= min_score:
+        if top_n <= 1:
+            cat, score = _best_match(list(emb), pairs)
+            matches = [(cat, score)] if (cat is not None and score >= min_score) else []
+        else:
+            matches = _best_matches(list(emb), pairs, top_n=top_n, min_score=min_score)
+        for cat, score in matches:
             _link_chunk(conn, chunk_id, cat["id"], version=codebook_version,
                         confidence=score, source="deductive")
             linked += 1
