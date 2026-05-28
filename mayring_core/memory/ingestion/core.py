@@ -47,6 +47,7 @@ from mayring_core.memory.store import (
     find_by_text_hash,
     get_source,
     insert_chunk,
+    kv_get,
     kv_put,
     log_ingestion_event,
     upsert_source,
@@ -296,11 +297,22 @@ def ingest(
             from mayring_core.memory.ingestion.mayring_process import derive_labels_from_categories
             label_map = derive_labels_from_categories(conn, new_chunk_ids)
             for cid, labels in label_map.items():
+                top = labels[:5]
                 conn.execute(
                     "UPDATE chunks SET category_labels = ?, category_source = 'deductive-link' "
                     "WHERE chunk_id = ? AND is_active = 1",
-                    (",".join(labels[:5]), cid),
+                    (",".join(top), cid),
                 )
+                # WHY(2026-05-29): the loop above kv_put the chunk with EMPTY labels
+                # (insert ran before this derive); refresh the kv entry so retrieval
+                # (which hydrates from kv_get first) doesn't serve stale-empty
+                # category_labels for freshly-ingested chunks. The FK-based cat_match
+                # reads chunk_categories fresh, so only the labels view was stale.
+                cached = kv_get(cid)
+                if cached is not None:
+                    cached["category_labels"] = top
+                    cached["category_source"] = "deductive-link"
+                    kv_put(cid, cached)
             conn.commit()
         except Exception as exc:
             _log.warning("deductive category-link failed (source=%s): %s",
