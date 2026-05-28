@@ -656,8 +656,18 @@ def _rerank(
                      "sf": sf, "sl": sl}
             for a_label in ("issue", "goal", "intervention", "outcome", "unknown"):
                 stage[f"igio_{a_label}"] = 1.0 if axis == a_label else 0.0
-            stage["cat_match"] = scat_id   # reranker-v3 (#270): gelernt sobald geloggt
+            stage["cat_match"] = scat_id   # reranker-v3 (#270)
             score_final = score_v2(stage, rr_model)
+            # WHY(2026-05-28): the deterministic _CAT_MATCH_BOOST lives in
+            # score_v1 above, but v2 replaces score_v1 wholesale — so re-apply
+            # it here, else v2 loses reranker-v3's category match entirely and
+            # category-themed results drop out of top_k (smoke reranker_cat_
+            # match_fires went red the moment v2 went live). The LEARNED
+            # cat_match weight is NOT used for this: on was_referenced labels it
+            # trains strongly negative (~-2.6), which would BURY category
+            # matches — the opposite of the v3 intent. Surfacing the structured
+            # match deterministically keeps v1/v2 consistent (Phase-A design).
+            score_final = min(1.0, score_final + _CAT_MATCH_BOOST * scat_id)
         else:
             score_final = score_v1
 
