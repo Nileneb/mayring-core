@@ -23,7 +23,7 @@ _log = logging.getLogger(__name__)
 from mayring_core.memory.db_adapter import DBAdapter
 from mayring_core.memory.schema import Chunk, RetrievalRecord
 from mayring_core.memory.store import (
-    get_chunk, get_chunks_bulk, kv_get, get_feedback_score, get_chunks_by_source,
+    get_chunk, get_chunks_bulk, kv_get, get_feedback_score,
 )
 
 # Recency-Lane ("nie wieder out of context"): der laufende Session-Thread wird
@@ -40,18 +40,34 @@ def _session_recency_ids(
 ) -> list[str]:
     """Chunk-IDs der rollierenden conversation_summary-Source dieser Session.
 
-    Matcht das micro-batch source_id-Schema ``conversation:<ws>:<session16>``
-    (src/api/routes/memory.py). Jüngste zuerst; leer wenn keine Session/Source."""
-    if not session_id or not workspace_id:
+    Das micro-batch source_id-Schema ist ``conversation:<slug>:<session16>``
+    (src/api/routes/memory.py) — der Mittelteil ist der REPO/WORKSPACE-SLUG
+    ('mayringcoder'), NICHT die Workspace-UUID. Wir matchen daher per
+    Session-Suffix (``conversation:%:<session16>``) innerhalb des Workspaces,
+    statt die source_id mit der UUID zu konstruieren (fand sonst nichts —
+    live verifiziert). Jüngste zuerst; leer wenn keine Session/Source."""
+    if not session_id:
         return []
-    source_id = f"conversation:{workspace_id}:{session_id[:16]}"
+    pattern = f"conversation:%:{session_id[:16]}"
+    sql = ("SELECT chunk_id FROM chunks WHERE is_active = 1 AND source_id LIKE ?")
+    params: list = [pattern]
+    if workspace_id:
+        sql += " AND workspace_id = ?"
+        params.append(workspace_id)
+    sql += " ORDER BY created_at DESC, ordinal DESC LIMIT ?"
+    params.append(limit)
     try:
-        chunks = get_chunks_by_source(conn, source_id, active_only=True)
+        rows = conn.execute(sql, tuple(params)).fetchall()
     except Exception as exc:
-        _log.warning("session-recency lookup failed (%s): %s", source_id, exc)
+        _log.warning("session-recency lookup failed (%s): %s", pattern, exc)
         return []
-    chunks.sort(key=lambda c: (c.created_at or "", c.ordinal), reverse=True)
-    return [c.chunk_id for c in chunks[:limit]]
+    out: list[str] = []
+    for r in rows:
+        try:
+            out.append(r["chunk_id"])
+        except (TypeError, KeyError, IndexError):
+            out.append(r[0])
+    return out
 
 # ---------------------------------------------------------------------------
 # Query-Cache (in-process, invalidated on any memory mutation)
