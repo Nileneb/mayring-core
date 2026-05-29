@@ -57,6 +57,73 @@ from mayring_core.memory.store import (
 MEMORY_CHROMA_DIR: Path = CACHE_DIR / "memory_chroma"
 
 
+def _parse_label_array(raw: str, n: int) -> list[str]:
+    """Parse the batched reduction's reply into exactly n labels. Tries a JSON array
+    first, then a line-based fallback; raises (NOT silenced) if neither yields n —
+    the caller logs loud and the source stays uncategorized rather than mislabeled."""
+    import json
+    import re
+    s = (raw or "").strip()
+    m = re.search(r"\[.*\]", s, re.DOTALL)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            if isinstance(arr, list) and len(arr) == n:
+                return [str(x).strip() for x in arr]
+        except json.JSONDecodeError:
+            pass
+    lines = [ln.strip().strip('",[]').strip() for ln in s.splitlines()]
+    lines = [re.sub(r"^\[?\d+\]?[.):\s-]*", "", ln).strip() for ln in lines if ln]
+    if len(lines) == n:
+        return lines
+    raise ValueError(
+        f"_parse_label_array: konnte {n} Labels nicht aus LLM-Antwort lesen: {s[:200]!r}")
+
+
+def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
+                         model: str | None) -> list[str]:
+    """Eine gebatchte Mayring-Reduktion: N Textstellen (alle mit DEMSELBEN Ziel) → N
+    snake_case-Kategorie-Labels in Reihenfolge. Über die zentrale generate_text-Route
+    (PiQueue/cloud-split). Ein Retry, dann lautes Scheitern (kein stummes Mislabeling)."""
+    from mayring_core.providers import generate_text
+    if not items:
+        return []
+    task = items[0][1]
+    numbered = "\n".join(f"[{i}] {text[:800]}" for i, (text, _t) in enumerate(items))
+    prompt = (
+        "Du bildest Kategorien nach qualitativer Inhaltsanalyse (Mayring).\n"
+        f"ZIEL/Aufgabe (obligatorischer Bezug für ALLE Stellen): {task[:300]}\n\n"
+        f"Für jede der {len(items)} nummerierten Textstellen: gehe Paraphrase→"
+        "Generalisierung→Reduktion und bilde EINE prägnante Kategorie (snake_case, "
+        "max 4 Wörter), die den Bezug zum Ziel wahrt.\n\n"
+        f"{numbered}\n\n"
+        f"Antworte AUSSCHLIESSLICH mit einem JSON-Array aus genau {len(items)} Strings "
+        'in derselben Reihenfolge, z.B. ["label_0", "label_1"]. Kein weiterer Text.'
+    )
+    last_err: Exception | None = None
+    for _ in range(2):
+        raw = generate_text(prompt=prompt, ollama_url=ollama_url, model=model,
+                            label="mayring_reduce_batch")
+        try:
+            return _parse_label_array(raw, len(items))
+        except ValueError as e:
+            last_err = e
+    raise last_err  # type: ignore[misc]
+
+
+def _resolve_target_codebook_id(conn: Any, source_type: str) -> int:
+    """Wohin echte Neu-Kategorien geschrieben werden: das Basis-Codebook der Domäne
+    der Quelle (code→'generic', social→'sozialforschung'). Der deduktive Match bleibt
+    cross-codebook; nur das induktive Neu-Bilden braucht ein Ziel. Fallback 'generic'."""
+    from mayring_core.memory.ingestion.categorization import _SOURCE_TYPE_TO_CODEBOOK
+    domain = _SOURCE_TYPE_TO_CODEBOOK.get(source_type)
+    slug = {"code": "generic", "social": "sozialforschung"}.get(domain, "generic")
+    row = conn.execute("SELECT id FROM codebooks WHERE slug=?", (slug,)).fetchone()
+    if row is None:
+        row = conn.execute("SELECT id FROM codebooks ORDER BY id LIMIT 1").fetchone()
+    return int(row[0]) if row else 1
+
+
 def resolve_dedup(
     conn: Any,
     chunk: Chunk,
@@ -199,16 +266,15 @@ def ingest(
         else:
             chunks = structural_chunk(content, source.source_id, source.path)
 
-        # WHY(2026-05-29, category-consolidation): the LLM mayring_categorize pass
-        # is RETIRED here. Categorization is now the single cosine deductive link
-        # below (link_chunks_deductive, top_n=3) and the free-string
-        # category_labels are DERIVED from those FK links — one SoT
-        # (chunk_categories), no second parallel LLM-label system. The labels are
-        # back-written to the chunks after linking (insert stores them empty).
-        _ = (do_categorize, mode, codebook_choice, categorize_task)  # retired inputs
+        # WHY(canonical Mayring method): Kategorisierung = die EINE goal-anchored mixed
+        # Pipeline (categorize_chunks unten) — Ziel → Paraphrase/Generalisierung/Reduktion
+        # → cosine 0.75 → vorhandene nutzen, sonst induktiv neu. KEIN separater cheap
+        # cosine-only-Pfad mehr. Die free-string category_labels bleiben FK-abgeleitet
+        # (eine SoT chunk_categories). Siehe [[feedback-mayring-canonical-method]].
+        _ = (do_categorize, mode, codebook_choice)  # legacy flags, von categorize_chunks ersetzt
 
         new_chunk_ids: list[str] = []
-        chunk_cat_embeddings: list[tuple[str, list[float]]] = []
+        chunks_to_categorize: list[tuple[str, str]] = []
         deduped_count = 0
         skipped_filter = 0
         indexed = False
@@ -262,11 +328,11 @@ def ingest(
                     _log.warning("chroma upsert failed for %s: %s",
                                  chunk.chunk_id[:12], exc)
 
-            if emb is not None:
-                chunk_cat_embeddings.append((chunk.chunk_id, emb))
-
             kv_put(chunk.chunk_id, chunk.to_dict())
             new_chunk_ids.append(chunk.chunk_id)
+            # Die Reduktion (categorize_chunks) embedded das abgeleitete Kategorie-Label,
+            # nicht das Chunk-Embedding → hier nur (chunk_id, text) sammeln.
+            chunks_to_categorize.append((chunk.chunk_id, chunk.text))
 
         log_ingestion_event(
             conn,
@@ -275,25 +341,32 @@ def ingest(
             {"chunks": len(new_chunk_ids), "deduped": deduped_count, "filtered": skipped_filter},
         )
 
-    # WHY(phase3.2): the deductive category-link runs OUTSIDE batch_context, on
-    # the already-committed chunks. A link failure (e.g. category Chroma cold)
-    # must never roll back the stored chunks — logged loud, never silenced.
+    # WHY(canonical Mayring method): die EINE goal-anchored mixed Kategorisierung läuft
+    # OUTSIDE batch_context auf den schon committeten Chunks. Ein Fehler (LLM/Chroma kalt)
+    # darf die gespeicherten Chunks NIE zurückrollen — laut geloggt, nie stumm. Ziel ist
+    # obligatorisch: explizite Aufgabe (paper=Forschungsfrage, hook=derived task) oder, wenn
+    # keine, ein aus der Quelle abgeleiteter Anker — nie ganz ohne Bezug (sonst random).
     category_links = 0
-    if do_link and chunk_cat_embeddings:
-        from mayring_core.memory.ingestion.mayring_process import link_chunks_deductive
+    goal = categorize_task.strip() or f"Inhalte aus {source.source_type}: {source.path}"
+    if do_link and chunks_to_categorize and model:
+        from mayring_core.memory.ingestion.mayring_process import categorize_chunks
         from mayring_core.memory.store import get_chroma_collection
+        from mayring_core.providers import embed_texts as _embed_batch
         try:
-            category_links = link_chunks_deductive(
-                conn, get_chroma_collection("codebook_categories"),
-                chunk_cat_embeddings, project_id=link_project_id, top_n=3)
-            conn.commit()
-            _log.info("deductive category-link: %d/%d chunks linked (source=%s, project=%s)",
-                      category_links, len(chunk_cat_embeddings), source.source_id, link_project_id)
-            # Back-write the legacy free-string category_labels DERIVED from the FK
-            # links (one SoT). insert_chunk stored them empty now that the LLM
-            # categorize pass is retired; the ~10 category_labels consumers (IGIO
-            # classifier, wiki-edges, recap, search display, paper_rules) keep
-            # working unchanged — same column, FK-sourced.
+            results = categorize_chunks(
+                chunks_to_categorize, goal,
+                _resolve_target_codebook_id(conn, source.source_type),
+                conn=conn, chroma_categories=get_chroma_collection("codebook_categories"),
+                batch_embed_fn=lambda texts: _embed_batch(texts, ollama_url),
+                batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model),
+                match_codebook_id=None, project_id=link_project_id)
+            category_links = sum(1 for r in results if r.category_id is not None)
+            _log.info("mayring categorize: %d/%d chunks kategorisiert (source=%s, project=%s, ziel=%r)",
+                      category_links, len(chunks_to_categorize), source.source_id,
+                      link_project_id, goal[:60])
+            # Free-string category_labels FK-abgeleitet (eine SoT). insert_chunk schrieb sie
+            # leer; die ~10 Konsumenten (IGIO-Classifier, wiki-edges, recap, Such-Anzeige,
+            # paper_rules) laufen unverändert weiter — gleiche Spalte, FK-Quelle.
             from mayring_core.memory.ingestion.mayring_process import derive_labels_from_categories
             label_map = derive_labels_from_categories(conn, new_chunk_ids)
             for cid, labels in label_map.items():
