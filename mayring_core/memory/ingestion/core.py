@@ -416,7 +416,14 @@ def ingest(
                     kv_put(cid, cached)
             conn.commit()
         except Exception as exc:
-            _log.warning("deductive category-link failed (source=%s): %s",
+            # Rollback PFLICHT: eine hier offen gelassene Transaktion lockt die DB für ALLE
+            # anderen Writer dauerhaft ("database is locked", Incident 2026-05-29).
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 — rollback best-effort, Fehler nicht verschlucken
+                _log.warning("rollback after category-link failure also failed (source=%s)",
+                             source.source_id)
+            _log.warning("category-link failed (source=%s): %s",
                          source.source_id, exc)
 
     result = {

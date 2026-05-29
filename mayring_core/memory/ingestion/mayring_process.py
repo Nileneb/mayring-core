@@ -476,12 +476,16 @@ def mayring_process(
     active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
         chroma_categories, _load_categories(conn, codebook_id, ("active", "proposed"), active_project_id))
-    res = _assign_or_create(
-        conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
-        active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
-        project_id=active_project_id, promote_threshold=_promote_threshold(conn, codebook_id),
-        pi_job_id=pi_job_id)
-    conn.commit()
+    try:
+        res = _assign_or_create(
+            conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
+            active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
+            project_id=active_project_id, promote_threshold=_promote_threshold(conn, codebook_id),
+            pi_job_id=pi_job_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()  # offene Transaktion NIE leaken → kein persistenter DB-Lock
+        raise
     return res
 
 
@@ -520,12 +524,19 @@ def categorize_chunks(
     dedup_pairs = _category_embeddings(
         chroma_categories, _load_categories(conn, match_codebook_id, ("active", "proposed"), project_id))
     out: list[ProcessResult] = []
-    for (chunk_id, _text), candidate, emb in zip(items, candidates, embs):
-        if not candidate or not emb:
-            continue
-        out.append(_assign_or_create(
-            conn, chroma_categories, target_codebook_id, chunk_id, candidate, list(emb),
-            active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
-            project_id=project_id, promote_threshold=threshold))
-    conn.commit()
+    # Per-Chunk committen: hält den SQLite-Write-Lock NICHT über den ganzen Batch + alle
+    # Chroma-Upserts; rollback bei Fehler, damit NIE eine offene Transaktion leakt (sonst
+    # persistenter "database is locked" für alle anderen Writer — Incident 2026-05-29).
+    try:
+        for (chunk_id, _text), candidate, emb in zip(items, candidates, embs):
+            if not candidate or not emb:
+                continue
+            out.append(_assign_or_create(
+                conn, chroma_categories, target_codebook_id, chunk_id, candidate, list(emb),
+                active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
+                project_id=project_id, promote_threshold=threshold))
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return out
