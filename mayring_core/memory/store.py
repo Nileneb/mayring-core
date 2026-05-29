@@ -1130,6 +1130,46 @@ def update_chunk_igio_axis(
     return True
 
 
+def log_context_injection(
+    conn: Any,
+    *,
+    trigger_ids: Any,
+    context_text: str,
+    workspace_id: str = "default",
+    query: str = "",
+    stage_scores: Any = None,
+    reranker_version: str = "v1",
+    was_referenced: int = 0,
+    led_to_retrieval: int = 0,
+    relevance_score: float = 0.0,
+) -> None:
+    """DIE EINE Telemetrie-Funktion für context_feedback_log.
+
+    ALLE Inject-Pfade (REST /memory/search, MCP search_memory, ambient) rufen NUR diese —
+    mit dem VOLLEN Spaltensatz inkl. workspace_id + query + stage_scores + reranker_version.
+    Vorher drei divergierte INSERTs: zwei (MCP, ambient) ließen workspace_id/query/stage_scores
+    weg → mis-scopete, feature-lose Rows, die die workspace-gescopten Dashboards (Memory-
+    Effizienz) UNTERZÄHLTEN (alle MCP-Connector-Injektionen unsichtbar) + fürs Reranker-Training
+    nutzlos waren. Telemetrie: DB-Fehler (locked / Spalte fehlt) werden geloggt, nie
+    hot-path-blockierend. trigger_ids/stage_scores werden zu JSON serialisiert wenn nötig."""
+    ids = trigger_ids if isinstance(trigger_ids, str) else json.dumps(list(trigger_ids or []))
+    stage = stage_scores if isinstance(stage_scores, str) else json.dumps(stage_scores or {})
+    try:
+        conn.execute(
+            "INSERT INTO context_feedback_log "
+            "(trigger_ids, context_text, was_referenced, led_to_retrieval, relevance_score, "
+            " captured_at, query, stage_scores, workspace_id, reranker_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ids, (context_text or "")[:2000], int(was_referenced), int(led_to_retrieval),
+             float(relevance_score), datetime.now(timezone.utc).isoformat(),
+             (query or "")[:1000], stage, workspace_id, reranker_version),
+        )
+        _maybe_commit(conn)
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+        import logging
+        logging.getLogger(__name__).warning("context_feedback_log insert skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Feedback
 # ---------------------------------------------------------------------------

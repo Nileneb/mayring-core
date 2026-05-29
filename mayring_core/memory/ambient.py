@@ -249,6 +249,7 @@ def compute_feedback(
     led_to_retrieval: bool,
     conn: DBAdapter,
     ollama_url: str,
+    workspace_id: str = "default",
 ) -> ContextFeedback:
     """Compute implicit feedback by embedding-cosine context vs. response.
 
@@ -283,24 +284,13 @@ def compute_feedback(
         captured_at=captured_at,
     )
 
-    # WHY(v2-stufe2.1): Telemetrie-Insert. sqlite-Fehler (DB-locked,
-    # Spalte fehlt) schlucken; alles andere muss laut.
-    import sqlite3 as _sqlite3
-    try:
-        with batch_context(conn):
-            conn.execute(
-                """INSERT INTO context_feedback_log
-                   (trigger_ids, context_text, was_referenced, led_to_retrieval, relevance_score, captured_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (json.dumps(trigger_ids), context_text[:500],
-                 int(was_referenced), int(led_to_retrieval),
-                 relevance_score, captured_at),
-            )
-    except (_sqlite3.OperationalError, _sqlite3.IntegrityError) as e:
-        import logging as _logging
-        _logging.getLogger(__name__).warning(
-            "context_feedback_log insert skipped: %s", e,
-        )
+    # EINE Logging-Funktion (store.log_context_injection) — ambient nutzt jetzt denselben
+    # Schreibweg wie REST- + MCP-Search statt einer eigenen (verarmten) INSERT-Kopie.
+    from mayring_core.memory.store import log_context_injection
+    log_context_injection(
+        conn, trigger_ids=trigger_ids, context_text=context_text,
+        workspace_id=workspace_id, was_referenced=int(was_referenced),
+        led_to_retrieval=int(led_to_retrieval), relevance_score=relevance_score)
 
     return fb
 
