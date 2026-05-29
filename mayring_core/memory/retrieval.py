@@ -777,6 +777,20 @@ def _rerank(
     records.sort(key=lambda r: r.score_final, reverse=True)
     ranked = records[:top_k]
 
+    # GUARANTEE the session thread is in the returned top_k. The floor alone is
+    # not enough: nomic-embed gives ~0.55-0.7 to almost everything, so a session
+    # chunk floored to 0.5 gets buried below noise and truncated. Reserve slots
+    # (dropping the weakest NON-session matches) so "nie wieder out of context"
+    # actually holds. Bounded by how many session chunks exist (≤ a few).
+    if session_chunk_ids:
+        reserved = [r for r in records
+                    if r.chunk_id in session_chunk_ids
+                    and r.chunk_id not in {x.chunk_id for x in ranked}]
+        if reserved:
+            keep = [r for r in ranked if r.chunk_id not in session_chunk_ids]
+            keep = keep[:max(0, top_k - len(reserved))]
+            ranked = sorted(reserved + keep, key=lambda r: r.score_final, reverse=True)[:top_k]
+
     # Issue #185/#182 follow-up: enrich each top-K record with rationale-edges
     # from wiki_v2.db (attached as 'wikidb' in init_memory_db). Join key:
     # chunk's source.path → wiki_edges.source. Silent skip when not attached.
