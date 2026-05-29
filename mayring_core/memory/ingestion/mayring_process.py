@@ -168,9 +168,33 @@ def _infer_igio_axis(name: str) -> str | None:
 
 
 def _clean_label(raw: str) -> str:
+    """Säubert die LLM-Antwort zu EINEM Kategorie-Label. Wenn das Modell statt eines bloßen
+    snake_case-Labels JSON geleakt hat (Objekt/Array — passiert ohne JSON-Mode bzw. wenn der
+    Batch-Parse aufs per-item-Fallback fällt), erst die VALUES extrahieren; bleibt es JSON-ish,
+    verwerfen (→ ''), statt einen kaputten Namen wie {"x":""} als Kategorie zu speichern
+    (Root-Cause der JSON-Namen-Junk in Prod). '' → Caller überspringt/fail-closed."""
     line = (raw or "").strip().splitlines()[0] if (raw or "").strip() else ""
     line = line.strip().strip("\"'`").strip()
-    # collapse to a single snake_case-ish token group, max 60 chars
+    if any(ch in line for ch in '{}[]"'):
+        # Versuch, das eigentliche Label aus geleaktem JSON zu bergen (erster String-Value),
+        # sonst verwerfen — nie den rohen JSON-Blob als Namen behalten.
+        import json
+        import re
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                vals = [v for v in obj.values() if isinstance(v, str) and v.strip()]
+                line = vals[0] if vals else (next(iter(obj), "") if obj else "")
+            elif isinstance(obj, list) and obj:
+                line = str(obj[0])
+            else:
+                line = ""
+        except (json.JSONDecodeError, TypeError):
+            m = re.search(r'"\s*:\s*"([^"]+)"', line) or re.search(r'([A-Za-z][\w-]{2,})', line)
+            line = m.group(1) if m else ""
+        line = line.strip().strip("\"'`").strip()
+        if any(ch in line for ch in '{}[]"'):
+            return ""
     return line[:60]
 
 
