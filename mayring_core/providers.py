@@ -79,6 +79,9 @@ def _default_generate(
     *,
     system_prompt: str | None = None,
     keep_alive: str | None = None,
+    options: dict | None = None,
+    response_format: str | None = None,
+    num_predict: int = 4096,
 ) -> str:
     from mayring_core.config import OLLAMA_TIMEOUT
     from mayring_core.ollama_client import generate
@@ -90,6 +93,9 @@ def _default_generate(
         timeout=OLLAMA_TIMEOUT,
         label=label,
         keep_alive=keep_alive,
+        options=options,
+        response_format=response_format,
+        num_predict=num_predict,
     )
 
 

@@ -17,9 +17,12 @@ from typing import Any, Callable
 
 # WHY(canonical Mayring method): die EINE Schwelle für die Zuordnungs-Entscheidung —
 # matcht die ABGELEITETE Kategorie (Paraphrase→Generalisierung→Reduktion) eine
-# vorhandene ziel-bezogene Kategorie mit cosine >= 0.75 → deduktiv zuordnen; sonst
-# induktiv neu bilden. Siehe [[feedback-mayring-canonical-method]].
-_MATCH_MIN = 0.75
+# vorhandene ziel-bezogene Kategorie mit cosine >= 0.70 → deduktiv zuordnen; sonst
+# induktiv neu bilden. 0.70 (vorher 0.75) = mehr Wiederverwendung statt Fragmente, da
+# reduzierte Labels spezifischer sind als die breiten Bestands-Kategorien (User 2026-05-29:
+# „mehr mergen") — zusammen mit der Granularitäts-Kalibrierung im reduce_prompt.
+# Siehe [[feedback-mayring-canonical-method]].
+_MATCH_MIN = 0.70
 # Embedding-Dedup beim induktiven Neu-Bilden: zwei Labels >0.92 = dieselbe Kategorie
 # unter anderem Namen → Evidenz statt Fragment (live: 3× "auth" durch unkontrolliertes Neu).
 _DEDUP_MIN = 0.92
@@ -284,19 +287,40 @@ def derive_query_category_ids(
     return {cid for s, cid in scored[:top_n] if s >= min_score}
 
 
-def reduce_prompt(text: str, task: str) -> str:
+def _granularity_hint(example_categories: list[str] | None) -> str:
+    """Kalibriert die Generalisierung auf das Abstraktionsniveau der BESTEHENDEN Kategorien
+    (Beispiele), damit das Label breit & wiederverwendbar wird statt hyper-spezifisch — so
+    matcht der nachgelagerte cosine-Schritt öfter eine vorhandene Kategorie (mehr Merging).
+    Zeigt nur das GRANULARITÄTSNIVEAU, KEINE Anweisung daraus zu wählen (die Zuordnung macht
+    weiterhin der cosine-Schritt, nicht das LLM)."""
+    if not example_categories:
+        return ""
+    sample = ", ".join(example_categories[:25])
+    return (
+        f"\nBestehende Kategorien haben dieses GRANULARITÄTSNIVEAU (Beispiele): {sample}.\n"
+        "Bilde dein Label auf GENAU DIESEM Abstraktionsniveau — breit & wiederverwendbar, "
+        "NICHT hyper-spezifisch. (Nicht aus der Liste wählen; nur die Granularität treffen.)\n"
+    )
+
+
+def reduce_prompt(text: str, task: str,
+                  example_categories: list[str] | None = None) -> str:
     """Mayrings Reduktion als Prompt: aus Rohtext, GEBUNDEN AN DAS ZIEL, über
     Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. Der Zielbezug ist
-    obligatorisch (sonst random Kategorien). Siehe [[feedback-mayring-canonical-method]]."""
+    obligatorisch (sonst random Kategorien). example_categories kalibrieren die
+    Generalisierung aufs Abstraktionsniveau der Bestands-Kategorien (mehr Merging).
+    Siehe [[feedback-mayring-canonical-method]]."""
     return (
         "Du bildest eine Kategorie nach qualitativer Inhaltsanalyse (Mayring).\n"
         f"ZIEL/Aufgabe (obligatorischer Bezug): {task[:300]}\n"
         f"Textstelle:\n{text[:1200]}\n\n"
         "Gehe in drei Schritten vor:\n"
         "1. PARAPHRASE: gib den inhaltstragenden Kern der Stelle knapp wieder.\n"
-        "2. GENERALISIERUNG: hebe ihn auf das Abstraktionsniveau des Ziels.\n"
+        "2. GENERALISIERUNG: hebe ihn auf das Abstraktionsniveau bestehender Kategorien "
+        "(breiter Konzept-Typ, nicht der Einzelfall).\n"
         "3. REDUKTION: verdichte zu EINER prägnanten Kategorie (snake_case, max 4 Wörter), "
         "die den Bezug zum Ziel wahrt.\n"
+        f"{_granularity_hint(example_categories)}"
         "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
     )
 
@@ -346,7 +370,7 @@ def _assign_or_create(
     induktive Dedup. `target_codebook_id` = wohin eine echte Neu-Kategorie geschrieben wird.
     `dedup_pairs` wird bei einer Neu-Kategorie IN-PLACE erweitert → nachfolgende Chunks
     desselben Batches dedupen darauf (intra-batch, ohne Reload). Schritte 3-5 des Ablaufs."""
-    # 3+4 deduktiv: abgeleitete Kategorie matcht eine vorhandene >= 0.75 → vorhandene nutzen
+    # 3+4 deduktiv: abgeleitete Kategorie matcht eine vorhandene >= 0.70 → vorhandene nutzen
     top_cat, score = _best_match(candidate_emb, active_pairs)
     if top_cat is not None and score >= _MATCH_MIN:
         if chunk_id:
@@ -405,25 +429,27 @@ def mayring_process(
 ) -> ProcessResult:
     """Die EINE Mayring-Methode (Einzel-Pfad: interaktiv + Advisor). IMMER mixed,
     IMMER ziel-gebunden. Ablauf: Ziel(=task) → REDUKTION ZUERST (Paraphrase→
-    Generalisierung→Reduktion) → cosine 0.75 gegen vorhandene (im gewählten Codebook)
-    → Treffer=deduktiv, sonst induktiv neu. Raises ValueError (→ HTTP 400) bei leerem
-    text/task. Siehe [[feedback-mayring-canonical-method]]."""
+    Generalisierung→Reduktion, kalibriert aufs Granularitätsniveau der vorhandenen
+    Kategorien) → cosine 0.70 gegen vorhandene (im gewählten Codebook) → Treffer=deduktiv,
+    sonst induktiv neu. Raises ValueError (→ HTTP 400) bei leerem text/task.
+    Siehe [[feedback-mayring-canonical-method]]."""
     if not (text or "").strip():
         raise ValueError("mayring_process: 'text' required (fail-closed)")
     if not (task or "").strip():
         raise ValueError("mayring_process: 'task' required — Zielbezug ist obligatorisch")
 
+    # active EINMAL laden — liefert sowohl die Granularitäts-Beispiele für die Reduktion
+    # als auch die Match-Menge (interaktiv: im gewählten Codebook).
+    active = _load_categories(conn, codebook_id, ("active",), active_project_id)
     # Schritt 1+2: aus Text GEBUNDEN AN DAS ZIEL die Kandidat-Kategorie ableiten.
-    candidate = _clean_label(llm_fn(reduce_prompt(text, task)))
+    candidate = _clean_label(llm_fn(reduce_prompt(text, task, [c["name"] for c in active])))
     if not candidate:
         raise ValueError("mayring_process: Reduktion lieferte kein Label (fail-closed)")
     candidate_emb = embed_fn(candidate)
     if not candidate_emb:
         raise ValueError("mayring_process: embedding der Kategorie fehlgeschlagen (fail-closed)")
 
-    # Interaktiv: Match + Create im gewählten Codebook.
-    active_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, codebook_id, ("active",), active_project_id))
+    active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
         chroma_categories, _load_categories(conn, codebook_id, ("active", "proposed"), active_project_id))
     res = _assign_or_create(
