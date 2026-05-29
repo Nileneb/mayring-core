@@ -81,12 +81,15 @@ def _parse_label_array(raw: str, n: int) -> list[str]:
 
 
 def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
-                         model: str | None) -> list[str]:
+                         model: str | None,
+                         example_categories: list[str] | None = None) -> list[str]:
     """Eine gebatchte Mayring-Reduktion: N Textstellen (alle mit DEMSELBEN Ziel) → N
     Kategorie-Labels in Reihenfolge. temperature=0 + JSON-Mode → deterministisch +
-    parsebar (gleicher Text → gleiches Label, damit Dedup/Evidenz akkumuliert). Fällt das
-    Batch-JSON trotzdem aus, per-item-Fallback (N Calls) — nie die ganze Quelle droppen."""
-    from mayring_core.memory.ingestion.mayring_process import reduce_prompt
+    parsebar (gleicher Text → gleiches Label, damit Dedup/Evidenz akkumuliert).
+    example_categories kalibrieren die Generalisierung aufs Granularitätsniveau der
+    Bestands-Kategorien (mehr Merging). Fällt das Batch-JSON trotzdem aus → per-item-Fallback
+    (N Calls) — nie die ganze Quelle droppen."""
+    from mayring_core.memory.ingestion.mayring_process import _granularity_hint, reduce_prompt
     from mayring_core.providers import generate_text
     if not items:
         return []
@@ -97,7 +100,8 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
         f"ZIEL/Aufgabe (obligatorischer Bezug für ALLE Stellen): {task[:300]}\n\n"
         f"Für jede der {len(items)} nummerierten Textstellen: gehe Paraphrase→"
         "Generalisierung→Reduktion und bilde EINE prägnante Kategorie (snake_case, "
-        "max 4 Wörter), die den Bezug zum Ziel wahrt.\n\n"
+        "max 4 Wörter), die den Bezug zum Ziel wahrt.\n"
+        f"{_granularity_hint(example_categories)}\n"
         f"{numbered}\n\n"
         f"Antworte AUSSCHLIESSLICH mit einem JSON-Array aus genau {len(items)} Strings "
         'in derselben Reihenfolge, z.B. ["label_0", "label_1"]. Kein weiterer Text.'
@@ -115,7 +119,8 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
     _log.warning("batch reduction JSON unparsbar nach 2 Versuchen — per-item fallback (%d items)",
                  len(items))
     return [
-        generate_text(prompt=reduce_prompt(text, task), ollama_url=ollama_url, model=model,
+        generate_text(prompt=reduce_prompt(text, task, example_categories),
+                      ollama_url=ollama_url, model=model,
                       label="mayring_reduce_one", options={"temperature": 0.0})
         for text, _t in items
     ]
@@ -363,12 +368,18 @@ def ingest(
         from mayring_core.memory.store import get_chroma_collection
         from mayring_core.providers import embed_texts as _embed_batch
         try:
+            # Granularitäts-Beispiele für die Reduktion: häufigste aktive Kategorien
+            # cross-codebook (Match ist cross-codebook) → das LLM hebt das Label aufs
+            # Niveau dieser Bestands-Kategorien (mehr Merging, weniger Fragmente).
+            example_cats = [r[0] for r in conn.execute(
+                "SELECT name FROM codebook_categories WHERE status='active' AND embedding_id != '' "
+                "ORDER BY evidence_count DESC LIMIT 30").fetchall()]
             results = categorize_chunks(
                 chunks_to_categorize, goal,
                 _resolve_target_codebook_id(conn, source.source_type),
                 conn=conn, chroma_categories=get_chroma_collection("codebook_categories"),
                 batch_embed_fn=lambda texts: _embed_batch(texts, ollama_url),
-                batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model),
+                batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model, example_cats),
                 match_codebook_id=None, project_id=link_project_id)
             category_links = sum(1 for r in results if r.category_id is not None)
             _log.info("mayring categorize: %d/%d chunks kategorisiert (source=%s, project=%s, ziel=%r)",
