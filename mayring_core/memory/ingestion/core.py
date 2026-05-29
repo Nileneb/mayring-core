@@ -56,6 +56,26 @@ from mayring_core.memory.store import (
 
 MEMORY_CHROMA_DIR: Path = CACHE_DIR / "memory_chroma"
 
+
+def _embed_one_with_retry(embed_fn, text: str, ollama_url: str, attempts: int = 2):
+    """Embed one text with a bounded retry.
+
+    WHY(write-leak): a single dropped request to the embedder (three.linn.games)
+    used to leave the chunk in SQLite but NEVER in Chroma → permanently
+    unsearchable ("out of context"). One retry rescues the common transient blip;
+    on permanent failure we re-raise so the caller can queue a reembed-pending
+    event (recoverable) instead of silently losing the chunk."""
+    import time as _t
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return embed_fn([text], ollama_url)[0]
+        except Exception as exc:  # provider errors vary; bounded retry, then re-raise
+            last = exc
+            if i < attempts - 1:
+                _t.sleep(0.5 * (2 ** i))
+    raise last if last is not None else RuntimeError("embed failed")
+
 # Fixer Seed für die Mayring-Reduktion: mit temperature=0 → reproduzierbares greedy decoding
 # pro Backend, damit derselbe Text dasselbe Label liefert (Dedup/Evidenz akkumuliert).
 _REDUCE_SEED = 7
@@ -323,9 +343,19 @@ def ingest(
             add_source_ref(conn, chunk.chunk_id, source.source_id, workspace_id)
 
             try:
-                emb = _embed_texts([chunk.text[:500]], ollama_url)[0]
+                emb = _embed_one_with_retry(_embed_texts, chunk.text[:500], ollama_url)
             except Exception as exc:
-                _log.warning("embed failed for %s: %s", chunk.chunk_id[:12], exc)
+                # Permanent embed failure: the chunk is in SQLite but won't be in
+                # Chroma → queue a reembed-pending event so the reconcile worker
+                # re-embeds it later, instead of leaving it silently unsearchable.
+                _log.warning("embed failed after retries for %s: %s — reembed-pending",
+                             chunk.chunk_id[:12], exc)
+                try:
+                    log_ingestion_event(conn, chunk.chunk_id, "reembed-pending",
+                                        {"workspace_id": workspace_id, "reason": str(exc)[:200]})
+                except Exception as log_exc:
+                    _log.warning("reembed-pending log failed for %s: %s",
+                                 chunk.chunk_id[:12], log_exc)
                 emb = None
 
             if chroma_collection is not None and emb is not None:

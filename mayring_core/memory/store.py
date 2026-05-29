@@ -950,13 +950,21 @@ def insert_chunk(
              start_offset, end_offset, text, text_hash, summary, category_labels,
              category_version, embedding_model, embedding_id, quality_score,
              dedup_key, category_source, category_confidence,
+             igio_axis, igio_confidence, igio_classified_at,
              created_at, superseded_by, is_active, workspace_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chunk_id) DO UPDATE SET
             text=excluded.text, text_hash=excluded.text_hash,
             summary=excluded.summary, category_labels=excluded.category_labels,
             category_source=excluded.category_source,
             category_confidence=excluded.category_confidence,
+            -- WHY(write-leak): persist the IGIO axis on insert (was dropped from
+            -- the column list entirely), but on re-ingest NEVER clobber a
+            -- classified axis with an unclassified ('') re-insert — only a real
+            -- incoming axis updates it. Preserves the IGIO-cron's work.
+            igio_axis = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_axis ELSE igio_axis END,
+            igio_confidence = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_confidence ELSE igio_confidence END,
+            igio_classified_at = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_classified_at ELSE igio_classified_at END,
             is_active=1, superseded_by=NULL, created_at=excluded.created_at,
             workspace_id=excluded.workspace_id
         """,
@@ -967,6 +975,7 @@ def insert_chunk(
             chunk.category_version, chunk.embedding_model, chunk.embedding_id,
             chunk.quality_score, chunk.dedup_key,
             chunk.category_source, chunk.category_confidence,
+            chunk.igio_axis, chunk.igio_confidence, chunk.igio_classified_at,
             chunk.created_at, chunk.superseded_by, int(chunk.is_active), _ws,
         ),
     )
