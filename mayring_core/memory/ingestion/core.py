@@ -56,6 +56,10 @@ from mayring_core.memory.store import (
 
 MEMORY_CHROMA_DIR: Path = CACHE_DIR / "memory_chroma"
 
+# Fixer Seed für die Mayring-Reduktion: mit temperature=0 → reproduzierbares greedy decoding
+# pro Backend, damit derselbe Text dasselbe Label liefert (Dedup/Evidenz akkumuliert).
+_REDUCE_SEED = 7
+
 
 def _parse_label_array(raw: str, n: int) -> list[str]:
     """Parse the batched reduction's reply into exactly n labels. Tries a JSON array
@@ -106,10 +110,13 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
         f"Antworte AUSSCHLIESSLICH mit einem JSON-Array aus genau {len(items)} Strings "
         'in derselben Reihenfolge, z.B. ["label_0", "label_1"]. Kein weiterer Text.'
     )
+    # temperature=0 + fixer seed → reproduzierbares greedy decoding pro Backend (gleicher
+    # Text → gleiches Label, damit Dedup/Evidenz akkumuliert statt zu fragmentieren).
+    reduce_opts = {"temperature": 0.0, "seed": _REDUCE_SEED}
     for _ in range(2):
         raw = generate_text(prompt=prompt, ollama_url=ollama_url, model=model,
                             label="mayring_reduce_batch",
-                            options={"temperature": 0.0}, response_format="json")
+                            options=reduce_opts, response_format="json")
         try:
             return _parse_label_array(raw, len(items))
         except ValueError:
@@ -121,7 +128,7 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
     return [
         generate_text(prompt=reduce_prompt(text, task, example_categories),
                       ollama_url=ollama_url, model=model,
-                      label="mayring_reduce_one", options={"temperature": 0.0})
+                      label="mayring_reduce_one", options=reduce_opts)
         for text, _t in items
     ]
 
