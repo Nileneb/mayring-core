@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import logging
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -21,7 +22,36 @@ _log = logging.getLogger(__name__)
 
 from mayring_core.memory.db_adapter import DBAdapter
 from mayring_core.memory.schema import Chunk, RetrievalRecord
-from mayring_core.memory.store import get_chunk, get_chunks_bulk, kv_get, get_feedback_score
+from mayring_core.memory.store import (
+    get_chunk, get_chunks_bulk, kv_get, get_feedback_score, get_chunks_by_source,
+)
+
+# Recency-Lane ("nie wieder out of context"): der laufende Session-Thread wird
+# als garantierter Kandidat geführt und auf einen score_final-Boden gehoben, der
+# das Hook-Gate (MAYRING_MIN_RERANK_SCORE=0.45) überschreitet — so bleibt "was ich
+# gerade tat" sichtbar, auch wenn die semantische Ähnlichkeit zur Query schwach ist.
+_SESSION_RECENCY_FLOOR = float(os.environ.get("MAYRING_SESSION_RECENCY_FLOOR", "0.5"))
+_SESSION_RECENCY_LIMIT = int(os.environ.get("MAYRING_SESSION_RECENCY_LIMIT", "3"))
+
+
+def _session_recency_ids(
+    conn: DBAdapter, workspace_id: str | None, session_id: str | None,
+    limit: int = _SESSION_RECENCY_LIMIT,
+) -> list[str]:
+    """Chunk-IDs der rollierenden conversation_summary-Source dieser Session.
+
+    Matcht das micro-batch source_id-Schema ``conversation:<ws>:<session16>``
+    (src/api/routes/memory.py). Jüngste zuerst; leer wenn keine Session/Source."""
+    if not session_id or not workspace_id:
+        return []
+    source_id = f"conversation:{workspace_id}:{session_id[:16]}"
+    try:
+        chunks = get_chunks_by_source(conn, source_id, active_only=True)
+    except Exception as exc:
+        _log.warning("session-recency lookup failed (%s): %s", source_id, exc)
+        return []
+    chunks.sort(key=lambda c: (c.created_at or "", c.ordinal), reverse=True)
+    return [c.chunk_id for c in chunks[:limit]]
 
 # ---------------------------------------------------------------------------
 # Query-Cache (in-process, invalidated on any memory mutation)
@@ -444,6 +474,7 @@ def _rerank(
     igio_intent: str | None = None,
     task_id: str | None = None,
     query_category_ids: set[int] | None = None,
+    session_chunk_ids: set[str] | None = None,
 ) -> list[RetrievalRecord]:
     """Combine scores and return top_k RetrievalRecords sorted by score_final DESC.
 
@@ -716,6 +747,17 @@ def _rerank(
             )
         )
 
+    # Recency-Lane: der laufende Session-Thread wird auf den Boden gehoben (nie
+    # gedeckelt), damit er das Hook-Gate überlebt und "was ich gerade tat" nicht
+    # verloren geht, wenn die semantische Ähnlichkeit zur Query schwach ist.
+    if session_chunk_ids:
+        for r in records:
+            if r.chunk_id in session_chunk_ids:
+                if r.score_final < _SESSION_RECENCY_FLOOR:
+                    r.score_final = _SESSION_RECENCY_FLOOR
+                if "session-recency" not in r.reasons:
+                    r.reasons.append("session-recency")
+
     records.sort(key=lambda r: r.score_final, reverse=True)
     ranked = records[:top_k]
 
@@ -830,6 +872,15 @@ def search(
         workspace_id=workspace_id, org_id=org_id, org_ids=org_ids,
         user_id=user_id, scope_key=scope_key, project_id=project_id,
     )
+
+    # Recency-Lane: den laufenden Session-Thread IMMER als Kandidat führen — auch
+    # wenn der scope-Filter (repo/project/source_type) ihn ausschließen würde. So
+    # bleibt "was ich gerade tat" verfügbar, statt am scope-Filter zu verschwinden.
+    session_ids = _session_recency_ids(conn, workspace_id, opts.get("session_id"))
+    if session_ids:
+        _seen = set(candidate_ids)
+        candidate_ids = list(candidate_ids) + [s for s in session_ids if s not in _seen]
+
     if not candidate_ids:
         # Tell callers WHY the result is empty: scope filter excluded
         # everything (workspace mismatch, no public/org/user share, etc.)
@@ -1078,6 +1129,7 @@ def search(
         igio_intent=igio_intent,
         task_id=opts.get("task_id"),
         query_category_ids=query_category_ids,
+        session_chunk_ids=set(session_ids) if session_ids else None,
     )
 
     # Enrich with cross-source refs (same text found in other sources).
