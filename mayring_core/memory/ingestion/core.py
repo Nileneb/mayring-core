@@ -83,8 +83,10 @@ def _parse_label_array(raw: str, n: int) -> list[str]:
 def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
                          model: str | None) -> list[str]:
     """Eine gebatchte Mayring-Reduktion: N Textstellen (alle mit DEMSELBEN Ziel) → N
-    snake_case-Kategorie-Labels in Reihenfolge. Über die zentrale generate_text-Route
-    (PiQueue/cloud-split). Ein Retry, dann lautes Scheitern (kein stummes Mislabeling)."""
+    Kategorie-Labels in Reihenfolge. temperature=0 + JSON-Mode → deterministisch +
+    parsebar (gleicher Text → gleiches Label, damit Dedup/Evidenz akkumuliert). Fällt das
+    Batch-JSON trotzdem aus, per-item-Fallback (N Calls) — nie die ganze Quelle droppen."""
+    from mayring_core.memory.ingestion.mayring_process import reduce_prompt
     from mayring_core.providers import generate_text
     if not items:
         return []
@@ -100,15 +102,23 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
         f"Antworte AUSSCHLIESSLICH mit einem JSON-Array aus genau {len(items)} Strings "
         'in derselben Reihenfolge, z.B. ["label_0", "label_1"]. Kein weiterer Text.'
     )
-    last_err: Exception | None = None
     for _ in range(2):
         raw = generate_text(prompt=prompt, ollama_url=ollama_url, model=model,
-                            label="mayring_reduce_batch")
+                            label="mayring_reduce_batch",
+                            options={"temperature": 0.0}, response_format="json")
         try:
             return _parse_label_array(raw, len(items))
-        except ValueError as e:
-            last_err = e
-    raise last_err  # type: ignore[misc]
+        except ValueError:
+            pass
+    # Fallback: per-item-Reduktion (deterministisch). Langsamer, aber garantiert N Labels
+    # in Reihenfolge → der Caller kategorisiert jeden Chunk, statt die ganze Quelle zu droppen.
+    _log.warning("batch reduction JSON unparsbar nach 2 Versuchen — per-item fallback (%d items)",
+                 len(items))
+    return [
+        generate_text(prompt=reduce_prompt(text, task), ollama_url=ollama_url, model=model,
+                      label="mayring_reduce_one", options={"temperature": 0.0})
+        for text, _t in items
+    ]
 
 
 def _resolve_target_codebook_id(conn: Any, source_type: str) -> int:
