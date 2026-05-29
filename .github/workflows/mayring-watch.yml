@@ -1,0 +1,16 @@
+name: mayring-watch
+on:
+  push:
+    branches: ["**"]
+  workflow_run:
+    workflows:
+      - "tests"
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  watch:
+    uses: Nileneb/mayring-claude-plugin/.github/workflows/repo-watch.yml@main
+    secrets:
+      # Reuse the repo's MCP service token as the reusable workflow's MAYRING_TOKEN.
+      MAYRING_TOKEN: ${{ secrets.MCP_SERVICE_TOKEN }}
