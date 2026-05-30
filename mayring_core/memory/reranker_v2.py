@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -50,13 +51,20 @@ _IGIO_AXES = ("issue", "goal", "intervention", "outcome", "unknown")
 # Geloggt + vom täglichen Trainer gewichtet; backward-compat (fehlt im Modell → w=0).
 _FEATURES = ("v", "s", "r", "a") + tuple(f"igio_{a}" for a in _IGIO_AXES) + ("cat_match",)
 _LOCK = threading.Lock()
-_CACHED_MODEL: dict[str, Any] | None = None
-_CACHED_MTIME: float = 0.0
+# Per-version cache: version → (model_dict_or_None, mtime). Keyed by version so
+# v2/v3/v4 can be loaded independently (reranker-version-table 2026-05-30).
+_MODEL_CACHE: dict[str, tuple[dict[str, Any] | None, float]] = {}
+
+_VERSION_RE = re.compile(r"^v\d+$")
 
 
-def _model_path() -> Path:
+def _cache_dir() -> Path:
     from mayring_core.config import CACHE_DIR
-    return CACHE_DIR / "rerank_v2.json"
+    return CACHE_DIR
+
+
+def _model_path(version: str = "v2") -> Path:
+    return _cache_dir() / f"rerank_{version}.json"
 
 
 # WHY(#180): degenerate-model sanity-gate. Production-incident 2026-05-09:
@@ -66,33 +74,30 @@ def _model_path() -> Path:
 # nicht negativ rankt werden). Alle Calls fallen lautlos auf v1-Weights
 # zurück. CHANGE WITH CARE — ohne diesen Gate war 5 Tage v2 produktiv,
 # hat aber Vector-Treffer aktiv runter gerankt.
-def _load_model() -> dict[str, Any] | None:
-    """Return the v2 model dict if the file exists and parses, else None.
-    Result is cached based on file mtime so retraining picks up cleanly
-    on the next call without restart."""
-    global _CACHED_MODEL, _CACHED_MTIME
-    path = _model_path()
+def _load_model(version: str = "v2") -> dict[str, Any] | None:
+    """Return the model dict for `version` if its file exists and parses, else None.
+    Result is cached per-version based on file mtime so retraining/version-switches
+    pick up cleanly on the next call without restart."""
+    path = _model_path(version)
     try:
         st = path.stat()
     except (FileNotFoundError, OSError):
         with _LOCK:
-            _CACHED_MODEL = None
-            _CACHED_MTIME = 0.0
+            _MODEL_CACHE.pop(version, None)
         return None
-    if _CACHED_MODEL is not None and st.st_mtime == _CACHED_MTIME:
-        return _CACHED_MODEL
+    cached = _MODEL_CACHE.get(version)
+    if cached is not None and cached[0] is not None and st.st_mtime == cached[1]:
+        return cached[0]
     with _LOCK:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            _log.warning("rerank_v2.json unreadable: %s — falling back to v1", e)
-            _CACHED_MODEL = None
-            _CACHED_MTIME = st.st_mtime
+            _log.warning("rerank_%s.json unreadable: %s — falling back to v1", version, e)
+            _MODEL_CACHE[version] = (None, st.st_mtime)
             return None
         if not isinstance(data, dict) or "weights" not in data:
-            _log.warning("rerank_v2.json malformed — falling back to v1")
-            _CACHED_MODEL = None
-            _CACHED_MTIME = st.st_mtime
+            _log.warning("rerank_%s.json malformed — falling back to v1", version)
+            _MODEL_CACHE[version] = (None, st.st_mtime)
             return None
         # Sanity-check: ein gelerntes Modell mit NEGATIVEM Vector- ODER
         # Symbolic-Gewicht ist degeneriert. Vector-Similarity und
@@ -115,24 +120,25 @@ def _load_model() -> dict[str, Any] | None:
         re_w = float(weights.get("re") or 0.0)
         if v_w < 0 or s_w < 0 or pt_w < 0 or re_w < 0:
             _log.error(
-                "rerank_v2.json degenerate (v=%.3f s=%.3f pt=%.3f re=%.3f); "
+                "rerank_%s.json degenerate (v=%.3f s=%.3f pt=%.3f re=%.3f); "
                 "refusing to load. Retrieval-positive Features dürfen "
-                "nicht negativ rankt werden.", v_w, s_w, pt_w, re_w,
+                "nicht negativ rankt werden.", version, v_w, s_w, pt_w, re_w,
             )
-            _CACHED_MODEL = None
-            _CACHED_MTIME = st.st_mtime
+            _MODEL_CACHE[version] = (None, st.st_mtime)
             return None
-        _CACHED_MODEL = data
-        _CACHED_MTIME = st.st_mtime
+        _MODEL_CACHE[version] = (data, st.st_mtime)
         return data
 
 
+def _model_healthy(version: str) -> bool:
+    """True iff the version's model file loads + passes the degenerate gate."""
+    return _load_model(version) is not None
+
+
 def invalidate_v2_cache() -> None:
-    """Force a reload on the next call. Call after a training run."""
-    global _CACHED_MODEL, _CACHED_MTIME
+    """Force a reload on the next call. Call after a training run / version switch."""
     with _LOCK:
-        _CACHED_MODEL = None
-        _CACHED_MTIME = 0.0
+        _MODEL_CACHE.clear()
 
 
 def _ab_pick(query_hint: str | None) -> str:
@@ -143,8 +149,7 @@ def _ab_pick(query_hint: str | None) -> str:
 
 
 def _default_state_path() -> Path:
-    from mayring_core.config import CACHE_DIR
-    return CACHE_DIR / "rerank_default.txt"
+    return _cache_dir() / "rerank_default.txt"
 
 
 def _read_runtime_default() -> str:
@@ -159,7 +164,7 @@ def _read_runtime_default() -> str:
     p = _default_state_path()
     try:
         v = p.read_text(encoding="utf-8").strip().lower()
-        if v in ("v1", "v2", "auto"):
+        if v in ("v1", "auto") or _VERSION_RE.match(v):
             return v
     except (OSError, FileNotFoundError):
         pass
@@ -167,14 +172,62 @@ def _read_runtime_default() -> str:
 
 
 def write_runtime_default(version: str) -> str:
-    """Set the persisted default. Used by the auto-rollout cron after
-    it sees a 25%+ uplift. Returns the value actually written."""
-    if version not in ("v1", "v2", "auto"):
-        raise ValueError(f"invalid default version: {version!r}")
+    """Set the active reranker version (manual selection from the dashboard table).
+
+    Accepts 'v1' (baseline), 'auto' (A/B), or any 'v<N>' whose model file exists.
+    Returns the value actually written.
+    """
+    version = (version or "").strip().lower()
+    if version in ("v1", "auto"):
+        pass
+    elif _VERSION_RE.match(version):
+        if not _model_path(version).exists():
+            raise ValueError(f"no model file for {version!r} (rerank_{version}.json missing)")
+    else:
+        raise ValueError(f"invalid reranker version: {version!r}")
     p = _default_state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(version, encoding="utf-8")
+    invalidate_v2_cache()
     return version
+
+
+def list_reranker_versions() -> list[dict[str, Any]]:
+    """All selectable reranker versions for the dashboard table.
+
+    Always includes the v1 baseline (hardcoded weights, no file) and every
+    cache/rerank_v<N>.json. Each entry carries metadata + an `active` flag.
+    """
+    active = _read_runtime_default()
+    out: list[dict[str, Any]] = [{
+        "version": "v1", "baseline": True, "active": active == "v1",
+        "healthy": True, "trained_at": None, "n_train": None, "metrics": None,
+    }]
+    try:
+        files = sorted(_cache_dir().glob("rerank_v*.json"),
+                       key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    except OSError:
+        files = []
+    for f in files:
+        version = f.stem.replace("rerank_", "")  # rerank_v3 → v3
+        if not _VERSION_RE.match(version):
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        out.append({
+            "version": version,
+            "baseline": False,
+            "active": active == version,
+            "healthy": _model_healthy(version),
+            "trained_at": data.get("trained_at"),
+            "n_train": data.get("n_train"),
+            "n_test": data.get("n_test"),
+            "metrics": data.get("metrics"),
+            "weights": data.get("weights"),
+        })
+    return out
 
 
 def get_active_reranker(
@@ -204,15 +257,15 @@ def get_active_reranker(
         or _read_runtime_default()
         or "auto"
     ).lower()
-    if raw not in ("v1", "v2", "auto"):
+    if raw != "auto" and raw != "v1" and not _VERSION_RE.match(raw):
         raw = "auto"
     if raw == "auto":
         raw = _ab_pick(query_hint)
-    if raw == "v2":
-        model = _load_model()
+    if raw != "v1":  # any learned version v<N>
+        model = _load_model(raw)
         if model is None:
-            return "v1", None  # silent fallback — never crash on missing model
-        return "v2", model
+            return "v1", None  # silent fallback — never crash on missing/degenerate model
+        return raw, model
     return "v1", None
 
 
