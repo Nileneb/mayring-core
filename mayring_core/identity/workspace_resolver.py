@@ -361,6 +361,34 @@ def add_alias(conn: DBAdapter, alias: str, workspace_id: str) -> None:
     conn.commit()
 
 
+def workspace_owner(conn, workspace_id: str) -> str | None:
+    """Return the owner user_id for a personal workspace, or None.
+
+    Reads MAYRING_PERSONAL_OWNERS env (JSON ws_id→user_id) — same env that
+    store._personal_owner_map uses for migration.  Importing from store
+    would create a circular dependency (store already imports workspace_resolver),
+    so we parse the env directly here, delegating to the shared helper via a
+    lazy import inside the function body.
+
+    WHY(tenancy-T7, owner-fallback): user-agnostic system ingests (Service-Token,
+    info.sub=None — repo-events, ambient, watcher) would otherwise write
+    private+user_id=NULL → invisible to everyone.  For personal workspaces we
+    fall back to the known owner so the chunk surfaces on their next search.
+    """
+    if conn is None or not workspace_id:
+        return None
+    # WHY(DRY): store._personal_owner_map holds the canonical env-parse logic;
+    # avoid duplicating it here.  The circular-import risk is real but scoped to
+    # the function body (lazy import) so it only triggers when the caller
+    # actually needs an owner lookup, not at module load time.
+    try:
+        from mayring_core.memory.store import _personal_owner_map  # noqa: PLC0415
+        mapping = _personal_owner_map(conn)
+    except Exception:
+        mapping = {}
+    return mapping.get(workspace_id)
+
+
 def workspace_kind(conn, workspace_id: str) -> str | None:
     """Return the kind column for a workspace row, or None if not found.
 
