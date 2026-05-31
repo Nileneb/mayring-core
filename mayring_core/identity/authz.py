@@ -32,3 +32,28 @@ def normalize_role(role: str | None) -> str:
         return "user"
     r = _LEGACY_ROLE_MAP.get(role, role)
     return r if r in ROLES else "user"
+
+
+def can(role: str, permission: str, *,
+        is_super_admin: bool = False,
+        is_public_ws: bool = False,
+        overrides: dict[tuple[str, str], bool] | None = None) -> bool:
+    """The single authorization decision (tenancy Phase B).
+
+    Order:
+      1. Public-workspace member-management is super-admin-exclusive.
+      2. Super-admin (JWT scope=admin) may do anything else.
+      3. admin keeps ADMIN_LOCKED_PERMISSIONS regardless of overrides (anti-lockout).
+      4. Per-workspace override wins; else DEFAULT_MATRIX; else False.
+    """
+    role = normalize_role(role)
+    if is_public_ws and permission == "manage_members":
+        return bool(is_super_admin)
+    if is_super_admin:
+        return True
+    if role == "admin" and permission in ADMIN_LOCKED_PERMISSIONS:
+        return True
+    ov = overrides or {}
+    if (role, permission) in ov:
+        return bool(ov[(role, permission)])
+    return bool(DEFAULT_MATRIX.get((role, permission), False))
