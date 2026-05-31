@@ -109,6 +109,23 @@ _RECENCY_DECAY_DAYS = 30.0
 # Stage 1: Scope filter
 # ---------------------------------------------------------------------------
 
+def build_chroma_where(
+    workspace_id: str | None,
+    user_id: str | None,
+    org_ids: tuple[str, ...] | list[str] | None,
+) -> dict:
+    """visibility-Disjunktion für die Chroma-Vektorsuche (Phase A); spiegelt _scope_filter,
+    damit public/org-Chunks fremder Tenants als Vektor-Kandidaten zurückkommen. workspace_id
+    wird NICHT mehr als harter Filter genutzt."""
+    ors: list[dict] = [{"visibility": "public"}]
+    if user_id:
+        ors.append({"$and": [{"visibility": "private"}, {"user_id": user_id}]})
+    cleaned = [o for o in (org_ids or ()) if o]
+    if cleaned:
+        ors.append({"$and": [{"visibility": "org"}, {"org_id": {"$in": list(cleaned)}}]})
+    return {"$or": ors} if len(ors) > 1 else ors[0]
+
+
 def _scope_filter(
     conn: DBAdapter,
     repo: str | None = None,
@@ -123,13 +140,18 @@ def _scope_filter(
 ) -> list[str]:
     """Return chunk_ids of active chunks matching hard scope filters.
 
-    Visibility model — a chunk is visible to the caller when ANY of:
-      - visibility='public'                                  (everyone)
-      - visibility='org'     AND s.org_id   IN caller_orgs   (any of caller's orgs)
-      - visibility='user'    AND s.user_id  = caller_sub     (same human user,
-                                                              any workspace —
-                                                              claude.ai vs CLI)
-      - visibility='private' AND c.workspace_id = caller_ws  (legacy default)
+    Visibility model (tenancy Phase A — 3 values) — a chunk is visible to the
+    caller when ANY of:
+      - visibility='public'                                 (everyone)
+      - visibility='org'     AND s.org_id   IN caller_orgs  (any of caller's orgs)
+      - visibility='private' AND s.user_id  = caller_user   (same human user,
+                                                             any workspace —
+                                                             claude.ai web vs CLI)
+
+    'private' is now user_id-scoped, NOT workspace-scoped: the same human sees
+    their private memory across every device/workspace, while another human's
+    private chunks NEVER match. workspace_id only gates whether the visibility
+    disjunction is applied at all (None = no scoping, internal callers).
 
     org_ids supersedes the legacy single org_id param (V2 multi-org JWT).
     Both are accepted: callers passing org_id (singular) are folded into the
@@ -160,13 +182,11 @@ def _scope_filter(
             org_clause = ""
         query += (
             " AND (s.visibility = 'public'"
-            " OR (s.visibility = 'user' AND s.user_id = ?)"
             f"{org_clause}"
-            " OR (s.visibility = 'private' AND c.workspace_id = ?))"
+            " OR (s.visibility = 'private' AND s.user_id = ?))"
         )
-        params.append(user_id)
         params.extend(effective_org_ids)
-        params.append(workspace_id)
+        params.append(user_id)
     if repo:
         query += " AND s.repo = ?"
         params.append(repo)
@@ -968,9 +988,7 @@ def search(
                 vector_diag = f"chroma_empty(count={chroma_count})"
                 _log.warning("vector stage: chroma collection has 0 entries")
             else:
-                chroma_where = (
-                    {"workspace_id": {"$eq": workspace_id}} if workspace_id else None
-                )
+                chroma_where = build_chroma_where(workspace_id, user_id, org_ids)
                 results = None
                 try:
                     results = chroma_collection.query(
