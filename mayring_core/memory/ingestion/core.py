@@ -373,6 +373,12 @@ def ingest(
                                 "category_source": chunk.category_source,
                                 "category_confidence": chunk.category_confidence,
                                 "is_active": 1,
+                                # WHY(tenancy phase A): visibility-Achse muss im Vektorindex liegen,
+                                # sonst kann Chroma-where public/org-Chunks fremder Tenants nicht als
+                                # Kandidaten liefern; Chroma erlaubt kein None → "".
+                                "visibility": source.visibility,
+                                "org_id": source.org_id or "",
+                                "user_id": source.user_id or "",
                             }],
                         )
                     indexed = True
