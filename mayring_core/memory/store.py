@@ -120,7 +120,13 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       (ORDER BY created_at DESC LIMIT) stays cheap UNcached — its 15s cache
 #       served stale on write-then-read (watcher_hook_fires saw the ingest only
 #       after the TTL; same class as the feedback-log fix).
-CURRENT_SCHEMA_VERSION = 14
+#   v15 (tenancy phase A): visibility axis 4 values -> 3 values. Re-sorts
+#       existing rows (user->private, org/team-workspace private->org with
+#       org_id stamped, personal-workspace private gets user_id stamped) and
+#       tightens the sources.visibility CHECK to ('private','org','public').
+#       Runs at boot via migrate_visibility_axis() before the new scope_filter
+#       ships -> no search blackout.
+CURRENT_SCHEMA_VERSION = 15
 
 
 def _now_iso() -> str:
@@ -351,6 +357,225 @@ def _migrate_visibility_check(conn: DBAdapter) -> None:
         logging.getLogger(__name__).warning(
             "visibility-check migration failed: %s — DB still on old constraint", exc
         )
+
+
+# Tenancy Phase A (v15): the sources table after migrations carries
+# workspace_id + project_id (added by the generic column-migration on existing
+# DBs, and never present in the legacy CREATE TABLE block). This DDL is the
+# 3-value-CHECK rebuild target — an exact copy of the live column set, only the
+# visibility CHECK is tightened to ('private', 'org', 'public').
+_SOURCES_DDL_V15 = """
+    CREATE TABLE sources (
+        source_id       TEXT PRIMARY KEY,
+        source_type     TEXT NOT NULL DEFAULT 'repo_file',
+        repo            TEXT NOT NULL DEFAULT '',
+        path            TEXT NOT NULL DEFAULT '',
+        branch          TEXT NOT NULL DEFAULT 'main',
+        "commit"        TEXT NOT NULL DEFAULT '',
+        content_hash    TEXT NOT NULL DEFAULT '',
+        captured_at     TEXT NOT NULL,
+        visibility      TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private', 'org', 'public')),
+        org_id          TEXT DEFAULT NULL,
+        user_id         TEXT DEFAULT NULL,
+        scope_key       TEXT DEFAULT NULL,
+        workspace_id    TEXT NOT NULL DEFAULT 'default',
+        project_id      TEXT DEFAULT NULL
+    );
+"""
+
+
+def _personal_owner_map(conn: DBAdapter) -> dict:
+    """Owner lookup for personal workspaces, from env MAYRING_PERSONAL_OWNERS.
+
+    JSON object ws_id -> user_id. Returns {} when unset/empty/malformed — the
+    migration then simply skips the personal-owner stamping step (rows keep
+    their existing user_id, which is the safe no-op).
+    """
+    raw = os.environ.get("MAYRING_PERSONAL_OWNERS", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "MAYRING_PERSONAL_OWNERS is not valid JSON — ignoring"
+        )
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# WHY(tenancy-v15, BLOCKER 1): the sources indexes are CREATEd in _init_schema
+# BEFORE this migration runs, and the table rebuild (RENAME->CREATE->...->DROP)
+# drops them with the legacy table. The short-circuit `if current_version >=
+# CURRENT_SCHEMA_VERSION: return` then prevents _init_schema from ever
+# re-creating them -> full-table-scan on the retrieval hot path. Re-create them
+# in the same transaction as the rebuild. DDLs copied verbatim from
+# _init_schema (grep idx_sources).
+_SOURCES_INDEX_DDL_V15 = (
+    "CREATE INDEX IF NOT EXISTS idx_sources_workspace_id ON sources(workspace_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sources_scope_key ON sources(scope_key)",
+)
+
+
+def _copy_legacy_into_sources(conn: DBAdapter) -> None:
+    """INSERT...SELECT every legacy column into the freshly-built `sources`."""
+    legacy_cols = conn.get_columns("sources_legacy_v15")
+    select_cols = ", ".join(
+        f'"{c}"' if c == "commit" else c
+        for c in legacy_cols
+    )
+    conn.execute(
+        f"INSERT INTO sources ({select_cols}) "
+        f"SELECT {select_cols} FROM sources_legacy_v15"
+    )
+
+
+def _rebuild_visibility_check_3values(conn: DBAdapter) -> None:
+    """Rebuild sources with the tightened 3-value visibility CHECK (v15).
+
+    SQLite can't ALTER a CHECK in place — rebuild via RENAME -> CREATE ->
+    INSERT SELECT -> DROP, mirroring _migrate_visibility_check. Idempotent:
+    no-ops once 'user' is gone from the live sources DDL in sqlite_master.
+
+    WHY(tenancy-v15, BLOCKER 2): the rebuild must be atomic. `executescript`
+    forces an implicit COMMIT, so RENAME+CREATE would land BEFORE the
+    INSERT...SELECT — a crash in between (OOM/cutover) would strand all rows in
+    sources_legacy_v15. We therefore build the new table with a single
+    `conn.execute` (no executescript), keep RENAME+CREATE+INSERT+DROP+indexes
+    in ONE transaction and commit only at the very end. On error we roll back
+    so a half-rebuild never persists. A recovery path handles the case where a
+    previous crash already swapped to the 3-value table but left legacy data.
+    """
+    rows = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sources'"
+    ).fetchall()
+    if not rows:
+        return
+    sql = rows[0][0] or ""
+
+    legacy_exists = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sources_legacy_v15'"
+    ).fetchone())
+
+    if "'user'" not in sql:
+        # Already on the 3-value CHECK. BLOCKER 2 (c): if a prior crash left a
+        # populated legacy table (RENAME+CREATE committed, INSERT did not), the
+        # new `sources` is empty and the rows live only in the legacy table.
+        # Recover by completing the copy instead of blindly skipping.
+        if not legacy_exists:
+            return
+        new_count = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        legacy_count = conn.execute(
+            "SELECT COUNT(*) FROM sources_legacy_v15"
+        ).fetchone()[0]
+        if new_count == 0 and legacy_count > 0:
+            # WHY(tenancy-v15): toggle FK off so the DROP doesn't dangle the
+            # chunks FK (same reasoning as the main rebuild below).
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                _copy_legacy_into_sources(conn)
+                conn.execute("DROP TABLE sources_legacy_v15")
+                for ddl in _SOURCES_INDEX_DDL_V15:
+                    conn.execute(ddl)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys = ON")
+        else:
+            # New table already populated — the legacy table is stale residue.
+            conn.execute("DROP TABLE IF EXISTS sources_legacy_v15")
+            conn.commit()
+        return
+
+    # WHY(tenancy-v15): with foreign_keys=ON, ALTER TABLE ... RENAME rewrites
+    # chunks.source_id's REFERENCES to the renamed table, so DROPping it would
+    # leave the chunks FK dangling -> next insert_chunk fails ("no such table
+    # sources_legacy_v15"). legacy_alter_table=ON suppresses that rewrite so
+    # the FK re-binds to the freshly CREATEd `sources`. foreign_keys can only
+    # be toggled outside a transaction, so commit first and restore after.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        # BLOCKER 2 (b): a stale legacy table from an aborted earlier run would
+        # make the RENAME fail ("table sources_legacy_v15 already exists").
+        # Drop it defensively first. (Reached only when 'user' is still in the
+        # live CHECK, i.e. the rebuild genuinely hasn't completed.)
+        conn.execute("DROP TABLE IF EXISTS sources_legacy_v15")
+        conn.execute("ALTER TABLE sources RENAME TO sources_legacy_v15")
+        # BLOCKER 2 (a): single execute, NOT executescript — no implicit commit
+        # splits the rebuild. RENAME+CREATE+INSERT+DROP+indexes stay in one
+        # transaction, committed only at the end.
+        conn.execute(_SOURCES_DDL_V15)
+        _copy_legacy_into_sources(conn)
+        conn.execute("DROP TABLE sources_legacy_v15")
+        for ddl in _SOURCES_INDEX_DDL_V15:
+            conn.execute(ddl)
+        conn.commit()
+    except Exception:
+        # BLOCKER (rollback): drop the half-built state so the next boot retries
+        # from a consistent point instead of stranding data.
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def migrate_visibility_axis(conn: DBAdapter, personal_owner: dict | None = None) -> None:
+    """Re-sort sources rows onto the 3-value visibility axis (v15).
+
+    1. visibility='user' -> 'private' (user_id is already cross-device-me).
+    2. visibility='private' in an org/team workspace -> 'org', org_id stamped
+       from workspace_id.
+    3. visibility='private' in a personal workspace -> stamp user_id = owner
+       (from `personal_owner` ws_id->user_id) where it is NULL/empty.
+    Then tighten the CHECK to ('private', 'org', 'public') via table rebuild.
+
+    Run BEFORE the new scope_filter ships so retrieval never goes dark.
+    """
+    personal_owner = personal_owner or {}
+
+    # 1. legacy 'user' is now plain user_id-scoped 'private'.
+    conn.execute(
+        "UPDATE sources SET visibility = 'private' WHERE visibility = 'user'"
+    )
+
+    # 2. workspace-scoped 'private' rows in org/team workspaces become 'org'.
+    # workspaces.kind CHECK ships ('user','team','project','system'); 'team'
+    # and 'project' are the shared/org buckets. ('organization' is included
+    # defensively for any externally-seeded row that used the long form.)
+    #
+    # WHY(tenancy-v15, ordering): step 1 above just converted 'user' rows to
+    # 'private' WITH a user_id set. Those are user-owned, not workspace-shared —
+    # promoting them to 'org' would leak a personal chunk into the whole team.
+    # Restrict the org promotion to genuinely workspace-scoped rows (no owner),
+    # so ex-'user' rows stay 'private'.
+    conn.execute(
+        "UPDATE sources SET visibility = 'org', org_id = workspace_id "
+        "WHERE visibility = 'private' AND (user_id IS NULL OR user_id = '') "
+        "AND workspace_id IN ("
+        "  SELECT id FROM workspaces WHERE kind IN ('team', 'project', 'organization')"
+        ")"
+    )
+
+    # 3. personal-workspace 'private' rows get their owner stamped (where blank).
+    for ws_id, user_id in personal_owner.items():
+        if not user_id:
+            continue
+        conn.execute(
+            "UPDATE sources SET user_id = ? "
+            "WHERE workspace_id = ? AND visibility = 'private' "
+            "AND (user_id IS NULL OR user_id = '')",
+            (user_id, ws_id),
+        )
+
+    _rebuild_visibility_check_3values(conn)
+    conn.commit()
 
 
 def _migrate_devices_composite_pk(conn: DBAdapter) -> None:
@@ -856,6 +1081,13 @@ def _init_schema(conn: DBAdapter) -> None:
            ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at""",
         (_now, _now),
     )
+
+    # v15 (tenancy phase A): re-sort the visibility axis (user->private,
+    # org/team-workspace private->org, personal-workspace private gets owner
+    # stamped) and tighten the sources.visibility CHECK to 3 values. Runs here
+    # — before the PRAGMA bump — so a half-migrated DB re-runs it on next boot.
+    if current_version < 15:
+        migrate_visibility_axis(conn, personal_owner=_personal_owner_map(conn))
 
     # Update schema version in PRAGMA user_version to mark migration as complete
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
