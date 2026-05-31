@@ -126,7 +126,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       tightens the sources.visibility CHECK to ('private','org','public').
 #       Runs at boot via migrate_visibility_axis() before the new scope_filter
 #       ships -> no search blackout.
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 
 
 def _now_iso() -> str:
@@ -1021,6 +1021,21 @@ def _init_schema(conn: DBAdapter) -> None:
             ON hook_events(workspace_id, fired_at);
     """)
 
+    # v16 (tenancy phase B): per-workspace role permission overrides.
+    # Absence of a row means the DEFAULT_MATRIX from authz.py applies.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_role_permissions (
+            workspace_id TEXT NOT NULL,
+            role         TEXT NOT NULL CHECK(role IN ('user','editor','admin')),
+            permission   TEXT NOT NULL,
+            allowed      INTEGER NOT NULL DEFAULT 0,
+            updated_at   TEXT,
+            PRIMARY KEY (workspace_id, role, permission)
+        )
+        """
+    )
+
     # Migration: add missing columns to existing DBs
     _migrate_schema(conn)
 
@@ -1092,6 +1107,35 @@ def _init_schema(conn: DBAdapter) -> None:
     # Update schema version in PRAGMA user_version to mark migration as complete
     conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Role permission overrides (tenancy phase B)
+# ---------------------------------------------------------------------------
+
+def get_role_permissions(conn, workspace_id: str) -> "dict[tuple[str, str], bool]":
+    """All per-workspace overrides. Empty dict = use authz.DEFAULT_MATRIX."""
+    rows = conn.execute(
+        "SELECT role, permission, allowed FROM workspace_role_permissions WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall()
+    out: "dict[tuple[str, str], bool]" = {}
+    for r in rows:
+        role = r["role"] if hasattr(r, "keys") else r[0]
+        perm = r["permission"] if hasattr(r, "keys") else r[1]
+        allowed = r["allowed"] if hasattr(r, "keys") else r[2]
+        out[(role, perm)] = bool(allowed)
+    return out
+
+
+def set_role_permission(conn, workspace_id: str, role: str, permission: str, allowed: bool) -> None:
+    conn.execute(
+        "INSERT INTO workspace_role_permissions (workspace_id, role, permission, allowed, updated_at) "
+        "VALUES (?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(workspace_id, role, permission) DO UPDATE SET allowed = excluded.allowed, updated_at = excluded.updated_at",
+        (workspace_id, role, permission, 1 if allowed else 0),
+    )
     conn.commit()
 
 
