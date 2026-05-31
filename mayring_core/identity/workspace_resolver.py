@@ -361,6 +361,27 @@ def add_alias(conn: DBAdapter, alias: str, workspace_id: str) -> None:
     conn.commit()
 
 
+def workspace_kind(conn, workspace_id: str) -> str | None:
+    """Return the kind column for a workspace row, or None if not found.
+
+    WHY(tenancy phase A): ingest default-visibility needs to know whether the
+    target workspace is personal (kind='user') or org-artig (kind in
+    'team'/'project') to pick the right visibility default without requiring
+    callers to pass it explicitly.
+    """
+    if conn is None or not workspace_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT kind FROM workspaces WHERE id = ?", (workspace_id,)
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — old DB without workspaces table
+        return None
+    if row is None:
+        return None
+    return row["kind"] if hasattr(row, "keys") else row[0]
+
+
 def list_workspaces_for_user(conn: DBAdapter, user_id: int) -> list[dict]:
     """Return canonical + project workspaces owned by a user."""
     rows = conn.execute(
