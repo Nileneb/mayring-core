@@ -294,45 +294,66 @@ def ingest(
     if state == "changed" and not do_force:
         deactivate_chunks_by_source(conn, source.source_id)
 
-    # Ganze Pipeline (upsert_source + alle insert_chunk + log_events) läuft
-    # unter einem Commit. Das eliminiert bei einem typischen Populate
-    # (500 Files × 5 Chunks) ca. 2500 einzelne Commits und spart messbar
-    # Zeit ohne Transaktionssemantik zu brechen — Rollback bei Exception
-    # ist in batch_context enthalten.
+    # WHY(canonical Mayring method): Kategorisierung = die EINE goal-anchored mixed
+    # Pipeline (categorize_chunks unten) — Ziel → Paraphrase/Generalisierung/Reduktion
+    # → cosine 0.75 → vorhandene nutzen, sonst induktiv neu. KEIN separater cheap
+    # cosine-only-Pfad mehr. Die free-string category_labels bleiben FK-abgeleitet
+    # (eine SoT chunk_categories). Siehe [[feedback-mayring-canonical-method]].
+    _ = (do_categorize, mode, codebook_choice)  # legacy flags, von categorize_chunks ersetzt
+
+    from mayring_core.memory.ingestion.conversation_filter import should_skip_chunk
+
+    # WHY(db-lock cascade 2026-06-01): the Ollama calls (multiview generate +
+    # per-chunk embed) are SLOW network I/O. Running them INSIDE batch_context
+    # held the SQLite write-lock for the whole embed duration → when the embedder
+    # (three.linn.games) was slow, concurrent writers (pi_task_claim_cloud,
+    # /conversation/micro-batch) hit busy_timeout=10s and 500'd with "database is
+    # locked", stalling the A2A worker-claim and the app. Do ALL network I/O FIRST
+    # (no lock held), then a SHORT transaction for the SQLite + Chroma writes only.
+    if do_multiview and source.source_type == "github_issue" and model:
+        chunks = generate_multiview_chunks(source.source_id, content, ollama_url, model)
+    else:
+        chunks = structural_chunk(content, source.source_id, source.path)
+
+    eligible: list = []
+    skipped_filter = 0
+    for chunk in chunks:
+        skip, reason = should_skip_chunk(chunk.text, source.source_type)
+        if skip:
+            skipped_filter += 1
+            _log.info(
+                "pre-ingest filter skipped chunk %s (source=%s): %s",
+                chunk.chunk_id[:12], source.source_id, reason,
+            )
+            continue
+        eligible.append(chunk)
+
+    embeddings: dict[str, list | None] = {}
+    embed_errors: dict[str, str] = {}
+    for chunk in _tqdm(eligible, desc="Chunks embedden", unit="chunk", leave=False):
+        try:
+            embeddings[chunk.chunk_id] = _embed_one_with_retry(_embed_texts, chunk.text[:500], ollama_url)
+        except Exception as exc:
+            # Permanent embed failure: keep the chunk in SQLite but flag
+            # reembed-pending below so the reconcile worker re-embeds it later
+            # instead of leaving it silently unsearchable.
+            embeddings[chunk.chunk_id] = None
+            embed_errors[chunk.chunk_id] = str(exc)
+            _log.warning("embed failed after retries for %s: %s — reembed-pending",
+                         chunk.chunk_id[:12], exc)
+
+    # Short transaction: SQLite + Chroma writes only — no network I/O under lock.
+    # One commit still avoids ~2500 single commits on a typical populate; rollback
+    # on exception is in batch_context.
+    new_chunk_ids: list[str] = []
+    chunks_to_categorize: list[tuple[str, str]] = []
+    deduped_count = 0
+    indexed = False
     with batch_context(conn):
         upsert_source(conn, source, workspace_id=workspace_id)
         log_ingestion_event(conn, source.source_id, "ingest_start", {"path": source.path})
 
-        if do_multiview and source.source_type == "github_issue" and model:
-            chunks = generate_multiview_chunks(source.source_id, content, ollama_url, model)
-        else:
-            chunks = structural_chunk(content, source.source_id, source.path)
-
-        # WHY(canonical Mayring method): Kategorisierung = die EINE goal-anchored mixed
-        # Pipeline (categorize_chunks unten) — Ziel → Paraphrase/Generalisierung/Reduktion
-        # → cosine 0.75 → vorhandene nutzen, sonst induktiv neu. KEIN separater cheap
-        # cosine-only-Pfad mehr. Die free-string category_labels bleiben FK-abgeleitet
-        # (eine SoT chunk_categories). Siehe [[feedback-mayring-canonical-method]].
-        _ = (do_categorize, mode, codebook_choice)  # legacy flags, von categorize_chunks ersetzt
-
-        new_chunk_ids: list[str] = []
-        chunks_to_categorize: list[tuple[str, str]] = []
-        deduped_count = 0
-        skipped_filter = 0
-        indexed = False
-
-        from mayring_core.memory.ingestion.conversation_filter import should_skip_chunk
-
-        for chunk in _tqdm(chunks, desc="Chunks embedden", unit="chunk", leave=False):
-            skip, reason = should_skip_chunk(chunk.text, source.source_type)
-            if skip:
-                skipped_filter += 1
-                _log.info(
-                    "pre-ingest filter skipped chunk %s (source=%s): %s",
-                    chunk.chunk_id[:12], source.source_id, reason,
-                )
-                continue
-
+        for chunk in eligible:
             canonical, is_dup = resolve_dedup(conn, chunk, workspace_id=workspace_id)
             if is_dup:
                 deduped_count += 1
@@ -342,23 +363,16 @@ def ingest(
             insert_chunk(conn, chunk, workspace_id=workspace_id)
             add_source_ref(conn, chunk.chunk_id, source.source_id, workspace_id)
 
-            try:
-                emb = _embed_one_with_retry(_embed_texts, chunk.text[:500], ollama_url)
-            except Exception as exc:
-                # Permanent embed failure: the chunk is in SQLite but won't be in
-                # Chroma → queue a reembed-pending event so the reconcile worker
-                # re-embeds it later, instead of leaving it silently unsearchable.
-                _log.warning("embed failed after retries for %s: %s — reembed-pending",
-                             chunk.chunk_id[:12], exc)
+            emb = embeddings.get(chunk.chunk_id)
+            if emb is None:
                 try:
                     log_ingestion_event(conn, chunk.chunk_id, "reembed-pending",
-                                        {"workspace_id": workspace_id, "reason": str(exc)[:200]})
+                                        {"workspace_id": workspace_id,
+                                         "reason": embed_errors.get(chunk.chunk_id, "")[:200]})
                 except Exception as log_exc:
                     _log.warning("reembed-pending log failed for %s: %s",
                                  chunk.chunk_id[:12], log_exc)
-                emb = None
-
-            if chroma_collection is not None and emb is not None:
+            elif chroma_collection is not None:
                 try:
                     with _CHROMA_WRITE_LOCK:
                         chroma_collection.upsert(
