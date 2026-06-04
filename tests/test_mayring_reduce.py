@@ -1,28 +1,25 @@
 import json
-from mayring_core.memory.ingestion.mayring_process import reduce_prompt, mayring_reduce, ReduceResult
+
+from mayring_core.memory.ingestion.mayring_process import (
+    ReduceResult,
+    _structured_reduce_prompt,
+    mayring_reduce,
+    reduce_prompt,
+)
 
 
-def test_reduce_prompt_mode_deductive_forbids_new():
-    p = reduce_prompt("auth code", "security", ["auth", "api"], mode="deductive")
-    assert "security" in p
-    assert "auth, api" in p
-    assert "keine neue" in p.lower() or "nur aus" in p.lower()
-
-
-def test_reduce_prompt_mode_inductive_no_anchor_pressure():
-    p = reduce_prompt("auth code", "security", ["auth"], mode="inductive")
-    assert "frei" in p.lower() or "neu" in p.lower()
-
-
-def test_reduce_prompt_default_is_bare_label():
+def test_reduce_prompt_is_bare_label():
     p = reduce_prompt("auth code", "security")
     assert "NUR mit dem finalen Kategorie-Label" in p
+    # KEIN Modus mehr — die Methode ist immer mixed
+    assert "deduktiv" not in p.lower() and "induktiv" not in p.lower()
 
 
-def test_reduce_prompt_structured_asks_json():
-    p = reduce_prompt("auth code", "security", structured=True)
+def test_structured_reduce_prompt_asks_json():
+    p = _structured_reduce_prompt("auth code", "security", ["auth", "api"])
     assert "paraphrase" in p and "generalization" in p and "label" in p
     assert "JSON" in p
+    assert "auth, api" in p  # Granularitäts-Beispiele
 
 
 class _Chroma:
@@ -57,73 +54,68 @@ def _conn_with_one_active(tmp_path):
     return conn
 
 
-def test_mayring_reduce_deductive_hit(tmp_path):
+def test_mayring_reduce_deductive_half_hits_existing(tmp_path):
+    """Treffer >=0.70 → bestehende Kategorie (deduktive Hälfte der EINEN Methode)."""
     conn = _conn_with_one_active(tmp_path)
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
     res = mayring_reduce(
-        "JWT login flow", theme="security", codebook_id=1, conn=conn,
+        "JWT login flow", theme="security", conn=conn,
         chroma_categories=chroma,
         embed_fn=lambda s: [1.0, 0.0, 0.0],
-        llm_fn=lambda p: "auth_login",
-        reduce=True, mode="hybrid",
+        llm_fn=lambda p: json.dumps(
+            {"paraphrase": "uses jwt", "generalization": "authn", "label": "auth_login"}),
     )
     assert isinstance(res, ReduceResult)
-    assert res.candidates[0].match == "deductive"
-    assert res.candidates[0].label == "auth"
-    assert res.candidates[0].score >= 0.70
-
-
-def test_mayring_reduce_structured_fields(tmp_path):
-    conn = _conn_with_one_active(tmp_path)
-    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
-    res = mayring_reduce(
-        "JWT login flow", theme="security", codebook_id=1, conn=conn,
-        chroma_categories=chroma, embed_fn=lambda s: [1.0, 0.0, 0.0],
-        llm_fn=lambda p: json.dumps({"paraphrase": "uses jwt",
-                                     "generalization": "authn", "label": "auth_login"}),
-        reduce=True, structured=True,
-    )
     assert res.paraphrase == "uses jwt"
     assert res.generalization == "authn"
     assert res.candidates[0].match == "deductive"
+    assert res.candidates[0].label == "auth"          # bestehende, nicht das Roh-Label
+    assert res.candidates[0].score >= 0.70
 
 
-def test_reduce_false_never_calls_llm(tmp_path):
+def test_mayring_reduce_always_structured_even_if_llm_returns_bare(tmp_path):
+    """Fail-soft: liefert das LLM doch nur ein bare Label, bleibt die Methode nutzbar
+    (paraphrase/generalization leer, Kategorie trotzdem zugeordnet)."""
     conn = _conn_with_one_active(tmp_path)
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
-    calls = {"llm": 0}
-
-    def _boom(_p):
-        calls["llm"] += 1
-        raise AssertionError("LLM must NOT be called when reduce=False (#330/§5.1)")
-
     res = mayring_reduce(
-        "JWT login flow", theme="security", codebook_id=1, conn=conn,
+        "JWT login flow", theme="security", conn=conn,
         chroma_categories=chroma, embed_fn=lambda s: [1.0, 0.0, 0.0],
-        llm_fn=_boom, reduce=False, chunk_id="chk1",
+        llm_fn=lambda p: "auth_login",
     )
-    assert calls["llm"] == 0
-    assert res.candidates and res.candidates[0].match == "deductive"
-    n = conn.execute("SELECT COUNT(*) FROM chunk_categories WHERE chunk_id='chk1'").fetchone()[0]
-    assert n == 1
+    assert res.paraphrase == "" and res.generalization == ""
+    assert res.candidates[0].label == "auth"
+    assert res.candidates[0].match == "deductive"
 
 
-def test_reduce_false_multilabel_top_n(tmp_path):
+def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path):
+    """Kein cosine-Treffer → induktive Hälfte bildet neu (proposed) im Write-Target."""
     conn = _conn_with_one_active(tmp_path)
-    conn.execute(
-        "INSERT INTO codebook_categories(id,codebook_id,name,status,embedding_id,"
-        "evidence_count,project_id) VALUES (2,1,'api','active','cb:2',5,NULL)"
-    )
-    conn.commit()
-    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0], "cb:2": [0.9, 0.1, 0.0]})
-
-    def _boom(_p):
-        raise AssertionError("LLM must NOT be called when reduce=False, even top_n>1 (#330/§5.1)")
-
+    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
+    # Kandidat-Embedding orthogonal zur Bestandskategorie → kein Treffer → neu
     res = mayring_reduce(
-        "auth and routing", theme="backend", codebook_id=1, conn=conn,
-        chroma_categories=chroma, embed_fn=lambda s: [0.97, 0.05, 0.0],
-        llm_fn=_boom, reduce=False, top_n=2,
+        "completely unrelated topic", theme="ux", conn=conn,
+        chroma_categories=chroma, embed_fn=lambda s: [0.0, 1.0, 0.0],
+        llm_fn=lambda p: json.dumps(
+            {"paraphrase": "p", "generalization": "g", "label": "ux_flow"}),
+        chunk_id="chk1",
     )
-    labels = {c.label for c in res.candidates}
-    assert labels == {"auth", "api"}
+    assert res.candidates[0].label == "ux_flow"
+    assert res.candidates[0].match in ("inductive", "dedup")
+    row = conn.execute(
+        "SELECT name FROM codebook_categories WHERE name='ux_flow'").fetchone()
+    assert row is not None
+
+
+def test_mayring_reduce_fail_closed_on_empty(tmp_path):
+    conn = _conn_with_one_active(tmp_path)
+    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
+    import pytest
+    with pytest.raises(ValueError):
+        mayring_reduce("", theme="security", conn=conn,
+                       chroma_categories=chroma, embed_fn=lambda s: [1.0],
+                       llm_fn=lambda p: "x")
+    with pytest.raises(ValueError):
+        mayring_reduce("text", theme="", conn=conn,
+                       chroma_categories=chroma, embed_fn=lambda s: [1.0],
+                       llm_fn=lambda p: "x")
