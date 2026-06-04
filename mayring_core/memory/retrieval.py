@@ -104,6 +104,11 @@ _WEIGHTS = {
 
 _RECENCY_DECAY_DAYS = 30.0
 
+# C3 v18 (project-scoped memory): deterministic boost for chunks linked to the
+# session project. Module-level so it stays consistent across v1/v2 re-apply and
+# is testable. NOT a learned reranker feature (cat_match lesson, see _rerank).
+_PROJECT_MATCH_BOOST = 0.08
+
 
 # ---------------------------------------------------------------------------
 # Stage 1: Scope filter
@@ -199,14 +204,10 @@ def _scope_filter(
         # papers, never another project's chunks in the same workspace.
         query += " AND s.scope_key = ?"
         params.append(scope_key)
-    if project_id:
-        # #workspace-uuid-sot (v7): Project-ID-Dimension (User-Diagramm). Scopt
-        # die Suche auf EIN Projekt innerhalb des Workspace. NOTE: überlappt
-        # konzeptionell mit scope_key="project:<id>" (#252) — Konsolidierung auf
-        # EINE Achse (project_id kanonisch, scope_key→migrieren/retire) ist ein
-        # eigener Follow-up; nicht im selben Schritt überstürzen.
-        query += " AND c.project_id = ?"
-        params.append(project_id)
+    # C3 v18: project scoping ist ein deterministischer Boost (_rerank, unten),
+    # KEIN harter Filter — global/unverlinktes Wissen darf NIE versteckt werden.
+    # Der frühere `AND c.project_id = ?`-Filter (chunks.project_id, unbefüllt)
+    # ist hier stillgelegt; die Spalte bleibt dormant (nicht gedroppt).
 
     rows = conn.execute(query, params).fetchall()
 
@@ -511,6 +512,8 @@ def _rerank(
     task_id: str | None = None,
     query_category_ids: set[int] | None = None,
     session_chunk_ids: set[str] | None = None,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> list[RetrievalRecord]:
     """Combine scores and return top_k RetrievalRecords sorted by score_final DESC.
 
@@ -628,6 +631,19 @@ def _rerank(
                     f"WHERE chunk_id IN ({qp})", tuple(ids)).fetchall():
                 chunk_cat_map.setdefault(cid, set()).add(cat_id)
 
+    # C3 v18 (project-scoped memory): deterministic project_match boost. Chunks
+    # linked to the SESSION project (chunk_project_links) get a small fixed
+    # bump so project-relevant memory floats up — but it is ADDITIVE, never a
+    # hard filter, so global/unlinked knowledge is never hidden. Like cat_match,
+    # this is deliberately NOT a learned reranker feature (cat_match trained
+    # strongly negative on was_referenced labels → it would bury matches).
+    project_linked: set[str] = set()
+    if project_id and workspace_id and candidates:
+        from mayring_core.memory.store import project_linked_chunk_ids
+        project_linked = project_linked_chunk_ids(
+            conn, [c.chunk_id for c in candidates], project_id, workspace_id,
+        )
+
     for chunk in candidates:
         sv_raw = vector_scores.get(chunk.chunk_id, 0.0)         # for the record
         sv_eff = stretched_vec.get(chunk.chunk_id, 0.0)         # for ranking
@@ -666,6 +682,9 @@ def _rerank(
         # Reranker-v3 structured category_id match (s. Setup oben).
         scat_id = _category_id_match(query_cat_ids, chunk_cat_map.get(chunk.chunk_id, set()))
 
+        # C3 v18 project_match: 1.0 wenn an das Session-Projekt gelinkt (s. Setup oben).
+        sproj = 1.0 if chunk.chunk_id in project_linked else 0.0
+
         # WHY(2026-05-11 user-feedback): "Reasons sollten HOCH gewertet
         # werden, wenn sie in der suche auftauchen — hier sind ZUSAMMEN-
         # HÄNGE beschrieben". Konvergenz-bonus: wenn ≥2 unabhängige
@@ -696,6 +715,7 @@ def _rerank(
             + _CAT_HINT_BOOST * sc
             + _IGIO_INTENT_BOOST * si
             + _CAT_MATCH_BOOST * scat_id
+            + _PROJECT_MATCH_BOOST * sproj
             + convergence_bonus
         )
 
@@ -735,6 +755,9 @@ def _rerank(
             # matches — the opposite of the v3 intent. Surfacing the structured
             # match deterministically keeps v1/v2 consistent (Phase-A design).
             score_final = min(1.0, score_final + _CAT_MATCH_BOOST * scat_id)
+            # C3 v18: v2 replaces score_v1 wholesale, so re-apply the deterministic
+            # project_match boost here too (same rationale as cat_match above).
+            score_final = min(1.0, score_final + _PROJECT_MATCH_BOOST * sproj)
         else:
             score_final = score_v1
 
@@ -774,6 +797,7 @@ def _rerank(
                 score_llm=sl,
                 score_predicted_topic=sp,
                 score_cat_match=scat_id,
+                score_project_match=sproj,
                 score_final=score_final,
                 reasons=reasons,
                 source_id=chunk.source_id,
@@ -1178,6 +1202,8 @@ def search(
         task_id=opts.get("task_id"),
         query_category_ids=query_category_ids,
         session_chunk_ids=set(session_ids) if session_ids else None,
+        project_id=project_id,
+        workspace_id=workspace_id,
     )
 
     # Enrich with cross-source refs (same text found in other sources).

@@ -131,7 +131,12 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       Absence of a row means the DEFAULT_MATRIX from authz.py applies.
 #   v17 (C1 project-groups): project_groups table (named, colored groups per
 #       workspace) + projects.group_id FK column.
-CURRENT_SCHEMA_VERSION = 17
+#   v18 (C3 project-scoped memory): chunk_project_links table — 1-to-many
+#       chunk↔project links (origin_ref is nested-repo-aware). Retires the
+#       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
+#       favour of a deterministic project_match boost (the chunks.project_id
+#       column stays DORMANT, not dropped). No backfill.
+CURRENT_SCHEMA_VERSION = 18
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -744,6 +749,28 @@ def _init_schema(conn: DBAdapter) -> None:
         CREATE INDEX IF NOT EXISTS idx_project_groups_workspace
             ON project_groups(workspace_id);
 
+        -- C3 (project-scoped memory v18): 1-to-many chunk↔project links.
+        -- origin_ref is nested-repo-aware (e.g. a submodule path that pins
+        -- WHICH project a chunk belongs to inside a monorepo). source records
+        -- HOW the link was made (ingest, manual, …). Inject priorises the
+        -- session project via a DETERMINISTIC boost (retrieval._PROJECT_MATCH_
+        -- BOOST), never a hard filter — global/unlinked knowledge stays visible.
+        -- NOTE: indexes are inline-safe here because the table is entirely new
+        -- in v18 — no pre-v18 DB has it, so CREATE TABLE is a real create.
+        CREATE TABLE IF NOT EXISTS chunk_project_links (
+            chunk_id      TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            project_id    TEXT NOT NULL,
+            origin_ref    TEXT NOT NULL DEFAULT '',
+            source        TEXT NOT NULL DEFAULT '',
+            workspace_id  TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, project_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_project_links_ws_project
+            ON chunk_project_links(workspace_id, project_id);
+        CREATE INDEX IF NOT EXISTS idx_chunk_project_links_chunk
+            ON chunk_project_links(chunk_id);
+
         -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
         -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
         -- (embedding_id = Chroma-Doc-ID), NICHT pgvector. Single-Workspace → kein
@@ -1287,6 +1314,63 @@ def insert_chunk(
         ),
     )
     _maybe_commit(conn)
+
+
+def link_chunk_to_project(
+    conn: DBAdapter,
+    chunk_id: str,
+    project_id: str,
+    *,
+    origin_ref: str = "",
+    source: str = "",
+    workspace_id: str,
+    created_at: str | None = None,
+) -> None:
+    """Link a chunk to a project (C3 v18, 1-to-many via chunk_project_links).
+
+    Idempotent: the PK is (chunk_id, project_id), so a repeated link is a
+    no-op via INSERT OR IGNORE. origin_ref is nested-repo-aware (which
+    sub-project a chunk belongs to inside a monorepo); source records HOW the
+    link was made (e.g. 'ingest', 'manual').
+    """
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO chunk_project_links
+            (chunk_id, project_id, origin_ref, source, workspace_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (chunk_id, project_id, origin_ref, source, workspace_id,
+         created_at or _now_iso()),
+    )
+    _maybe_commit(conn)
+
+
+def project_linked_chunk_ids(
+    conn: DBAdapter,
+    chunk_ids: list[str],
+    project_id: str,
+    workspace_id: str,
+) -> set[str]:
+    """Return the subset of chunk_ids linked to project_id within workspace_id.
+
+    One bulk query (workspace-scoped). Empty chunk_ids or empty project_id
+    short-circuit to an empty set. Used by retrieval for the deterministic
+    project_match boost — NOT a hard filter.
+    """
+    if not chunk_ids or not project_id:
+        return set()
+    out: set[str] = set()
+    BATCH = 900  # stay under SQLite's 999 variable limit (+2 fixed params)
+    for i in range(0, len(chunk_ids), BATCH):
+        batch = chunk_ids[i:i + BATCH]
+        ph = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT chunk_id FROM chunk_project_links "
+            f"WHERE project_id = ? AND workspace_id = ? AND chunk_id IN ({ph})",
+            (project_id, workspace_id, *batch),
+        ).fetchall()
+        out.update(r[0] for r in rows)
+    return out
 
 
 def get_chunk(conn: DBAdapter, chunk_id: str, active_only: bool = True) -> Chunk | None:
