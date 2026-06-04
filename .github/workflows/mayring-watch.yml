@@ -8,6 +8,11 @@ on:
     types: [completed]
 permissions:
   contents: read
+  # repo-watch.yml authenticates to MayringCoder via GitHub OIDC (secretless) and
+  # requests id-token: write. A caller cannot grant a reusable workflow more than
+  # it holds itself, so without id-token here the called job is denied at startup
+  # (every run was startup_failure). Mirror the reusable workflow's requirement.
+  id-token: write
 jobs:
   watch:
     uses: Nileneb/mayring-claude-plugin/.github/workflows/repo-watch.yml@main
