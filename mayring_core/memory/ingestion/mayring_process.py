@@ -561,3 +561,111 @@ def categorize_chunks(
         conn.rollback()
         raise
     return out
+
+
+import json as _json_mod  # noqa: E402  — placed here to avoid top-level cycle risk
+
+
+@dataclass
+class Candidate:
+    label: str
+    match: str          # deductive | dedup | inductive
+    score: float
+    category_id: int | None = None
+
+
+@dataclass
+class ReduceResult:
+    paraphrase: str
+    generalization: str
+    candidates: list[Candidate]
+
+
+_DECISION_TO_MATCH = {
+    "deductive": "deductive",
+    "inductive-dedup": "dedup",
+    "inductive": "inductive",
+}
+
+
+def _parse_structured(raw: str) -> tuple[str, str, str]:
+    """JSON {paraphrase,generalization,label} → (paraphrase, generalization, clean label).
+    Fail-soft: kein JSON → ('', '', _clean_label(raw))."""
+    try:
+        obj = _json_mod.loads(raw)
+        if isinstance(obj, dict):
+            return (str(obj.get("paraphrase", "")).strip(),
+                    str(obj.get("generalization", "")).strip(),
+                    _clean_label(str(obj.get("label", ""))))
+    except (ValueError, TypeError):
+        pass
+    return "", "", _clean_label(raw)
+
+
+def mayring_reduce(
+    text: str, theme: str, codebook_id: int, *,
+    conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
+    mode: str = "hybrid", reduce: bool = True, structured: bool = False,
+    top_n: int = 1, chunk_id: str | None = None, codebook_version: int = 1,
+    project_id: str | None = None, match_codebook_id: int | None = None,
+) -> ReduceResult:
+    """Die EINE Mayring-Primitive. Zwei orthogonale Achsen:
+      mode   — Zuordnungsverhalten (inductive|deductive|hybrid), formt nur reduce_prompt.
+      reduce — True: LLM-Reduktion + cosine 0.70/0.92 (_assign_or_create, interaktiv/Einzel).
+               False: KEIN LLM — der Text selbst wird embedded und rein deduktiv (>=0.55)
+               gegen aktive Kategorien gematcht (Bulk-Ingest-Tier, #330/§5.1: NIE ans LLM koppeln).
+    Liefert paraphrase/generalization (nur bei reduce+structured) + candidates.
+    Raises ValueError bei leerem text/theme (fail-closed)."""
+    if not (text or "").strip():
+        raise ValueError("mayring_reduce: 'text' required (fail-closed)")
+    if not (theme or "").strip():
+        raise ValueError("mayring_reduce: 'theme' required — Zielbezug obligatorisch")
+
+    active = _load_categories(conn, match_codebook_id, ("active",), project_id)
+    active_pairs = _category_embeddings(chroma_categories, active)
+
+    # reduce=False: LLM-freier deduktiver Tier (Bulk, #330/§5.1) -------------------------
+    if not reduce:
+        text_emb = embed_fn(text[:1200])
+        if not text_emb:
+            return ReduceResult("", "", [])
+        matches = _best_matches(list(text_emb), active_pairs, top_n=max(1, top_n),
+                                min_score=_HYBRID_MIN)
+        cands = [Candidate(c["name"], "deductive", round(s, 4), c["id"]) for c, s in matches]
+        if chunk_id:
+            for c, s in matches:
+                _link_chunk(conn, chunk_id, c["id"], version=codebook_version,
+                            confidence=s, source="deductive")
+            conn.commit()
+        return ReduceResult("", "", cands)
+
+    # reduce=True: LLM-Reduktion + _assign_or_create ------------------------------------
+    raw = llm_fn(reduce_prompt(text, theme, [c["name"] for c in active],
+                               mode=mode, structured=structured))
+    if structured:
+        paraphrase, generalization, candidate = _parse_structured(raw)
+    else:
+        paraphrase, generalization, candidate = "", "", _clean_label(raw)
+    if not candidate:
+        raise ValueError("mayring_reduce: Reduktion lieferte kein Label (fail-closed)")
+    candidate_emb = embed_fn(candidate)
+    if not candidate_emb:
+        raise ValueError("mayring_reduce: embedding fehlgeschlagen (fail-closed)")
+
+    dedup_pairs = _category_embeddings(
+        chroma_categories,
+        _load_categories(conn, match_codebook_id, ("active", "proposed"), project_id))
+    target = match_codebook_id if match_codebook_id is not None else codebook_id
+    try:
+        res = _assign_or_create(
+            conn, chroma_categories, target, chunk_id, candidate, candidate_emb,
+            active_pairs, dedup_pairs, task=theme, codebook_version=codebook_version,
+            project_id=project_id, promote_threshold=_promote_threshold(conn, target))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    cands = [Candidate(res.category_name or candidate,
+                       _DECISION_TO_MATCH.get(res.decision, "inductive"),
+                       res.confidence, res.category_id)]
+    return ReduceResult(paraphrase, generalization, cands)
