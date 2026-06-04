@@ -97,7 +97,7 @@ class TestChromaMetadataVisibility:
             chroma_collection=collection,
             ollama_url="http://localhost:11434",
             model="",   # no LLM categorize
-            opts={"categorize": False, "link_categories": False},
+            opts={"categorize": False},
         )
 
         assert collection.count() > 0, "Expected at least one Chroma upsert"
@@ -140,7 +140,7 @@ class TestChromaMetadataVisibility:
             chroma_collection=collection,
             ollama_url="http://localhost:11434",
             model="",
-            opts={"categorize": False, "link_categories": False},
+            opts={"categorize": False},
         )
 
         assert collection.count() > 0, "Expected at least one Chroma upsert"
