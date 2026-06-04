@@ -328,29 +328,14 @@ def _granularity_hint(example_categories: list[str] | None) -> str:
     )
 
 
-def _mode_clause(mode: str) -> str:
-    """Steuert NUR den Zuordnungs-/Neubildungs-Teil. Die cosine-Entscheidung
-    macht weiterhin der Code (_assign_or_create), nicht das LLM — der Modus
-    formt nur, wie frei das Label gebildet werden darf."""
-    if mode == "deductive":
-        return ("Bilde KEINE neue Kategorie: wähle das Label so, dass es eine "
-                "der bestehenden Kategorien trifft (deduktiv).\n")
-    if mode == "inductive":
-        return ("Bilde das Label FREI aus dem Text (induktiv); die Beispiele "
-                "geben nur das Granularitätsniveau vor.\n")
-    return ("Triff wenn möglich eine bestehende Kategorie, sonst bilde eine "
-            "neue auf gleichem Granularitätsniveau (hybrid).\n")
-
-
-def reduce_prompt(text: str, task: str,
-                  example_categories: list[str] | None = None,
-                  mode: str = "hybrid", structured: bool = False) -> str:
-    """Mayrings Reduktion als Prompt: aus Rohtext, GEBUNDEN AN DAS ZIEL, über
-    Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. `mode` steuert
-    nur das Zuordnungsverhalten (deduktiv/induktiv/hybrid), nicht den cosine-Schritt.
-    `structured=True` → JSON mit paraphrase+generalization+label (für pi_summarize).
-    Siehe [[feedback-mayring-canonical-method]]."""
-    head = (
+def _reduce_head(text: str, task: str,
+                 example_categories: list[str] | None = None) -> str:
+    """Der gemeinsame Reduktions-Kopf der EINEN Methode: Ziel-Bezug + die drei
+    Mayring-Schritte (Paraphrase→Generalisierung→Reduktion) + Granularitäts-
+    Kalibrierung. KEIN Modus — die Methode ist IMMER mixed (deduktiv treffen,
+    sonst induktiv neu); welche Hälfte greift, entscheidet der cosine-Schritt
+    im Code (_assign_or_create), nicht das LLM. Siehe [[feedback-mayring-canonical-method]]."""
+    return (
         "Du bildest eine Kategorie nach qualitativer Inhaltsanalyse (Mayring).\n"
         f"ZIEL/Aufgabe (obligatorischer Bezug): {task[:300]}\n"
         f"Textstelle:\n{text[:1200]}\n\n"
@@ -360,15 +345,28 @@ def reduce_prompt(text: str, task: str,
         "(breiter Konzept-Typ, nicht der Einzelfall).\n"
         "3. REDUKTION: verdichte zu EINER prägnanten Kategorie (snake_case, max 4 Wörter), "
         "die den Bezug zum Ziel wahrt.\n"
-        f"{_mode_clause(mode)}"
         f"{_granularity_hint(example_categories)}"
     )
-    if structured:
-        return head + (
-            'Antworte NUR mit JSON: {"paraphrase":"...","generalization":"...",'
-            '"label":"<snake_case>"} — kein Markdown, keine Prosa.'
-        )
-    return head + "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
+
+
+def reduce_prompt(text: str, task: str,
+                  example_categories: list[str] | None = None) -> str:
+    """Reduktion → bare Label (für den Batch-/Einzelpfad mayring_process/categorize_chunks,
+    die das Label selbst embedden + via _assign_or_create mixed zuordnen)."""
+    return _reduce_head(text, task, example_categories) + (
+        "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes.")
+
+
+def _the_codebook_id(conn: Any) -> int:
+    """DAS eine, domänenunabhängige Codebook. Es gibt kein source_type→codebook-Routing
+    (kanonische Methode ist domänenunabhängig). Bevorzugt 'universal'; bis die 5→1-Migration
+    durch ist, sonst das einzige verbleibende. Kein Default-Raten — eine feste Quelle."""
+    row = conn.execute("SELECT id FROM codebooks WHERE slug='universal'").fetchone()
+    if row is None:
+        row = conn.execute("SELECT id FROM codebooks ORDER BY id LIMIT 1").fetchone()
+    if row is None:
+        raise ValueError("kein Codebook vorhanden — DB nicht initialisiert")
+    return int(row[0])
 
 
 def _promote_threshold(conn: Any, codebook_id: int) -> int:
@@ -468,25 +466,25 @@ def _assign_or_create(
 
 
 def mayring_process(
-    text: str, task: str, codebook_id: int, *,
+    text: str, task: str, *,
     conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
     chunk_id: str | None = None, pi_job_id: str = "", codebook_version: int = 1,
     active_project_id: str | None = None,
 ) -> ProcessResult:
     """Die EINE Mayring-Methode (Einzel-Pfad: interaktiv + Advisor). IMMER mixed,
-    IMMER ziel-gebunden. Ablauf: Ziel(=task) → REDUKTION ZUERST (Paraphrase→
-    Generalisierung→Reduktion, kalibriert aufs Granularitätsniveau der vorhandenen
-    Kategorien) → cosine 0.70 gegen vorhandene (im gewählten Codebook) → Treffer=deduktiv,
-    sonst induktiv neu. Raises ValueError (→ HTTP 400) bei leerem text/task.
-    Siehe [[feedback-mayring-canonical-method]]."""
+    IMMER ziel-gebunden, domänenunabhängig. Ablauf: Ziel(=task) → REDUKTION ZUERST
+    (Paraphrase→Generalisierung→Reduktion, kalibriert aufs Granularitätsniveau der
+    vorhandenen Kategorien) → cosine 0.70 gegen ALLE vorhandenen → Treffer=deduktiv, sonst
+    induktiv neu im EINEN Codebook. Kein codebook_id mehr (es gibt nur eins).
+    Raises ValueError (→ HTTP 400) bei leerem text/task. Siehe [[feedback-mayring-canonical-method]]."""
     if not (text or "").strip():
         raise ValueError("mayring_process: 'text' required (fail-closed)")
     if not (task or "").strip():
         raise ValueError("mayring_process: 'task' required — Zielbezug ist obligatorisch")
 
-    # active EINMAL laden — liefert sowohl die Granularitäts-Beispiele für die Reduktion
-    # als auch die Match-Menge (interaktiv: im gewählten Codebook).
-    active = _load_categories(conn, codebook_id, ("active",), active_project_id)
+    codebook_id = _the_codebook_id(conn)
+    # active EINMAL laden — Granularitäts-Beispiele für die Reduktion + Match-Menge (cross-codebook).
+    active = _load_categories(conn, None, ("active",), active_project_id)
     # Schritt 1+2: aus Text GEBUNDEN AN DAS ZIEL die Kandidat-Kategorie ableiten.
     candidate = _clean_label(llm_fn(reduce_prompt(text, task, [c["name"] for c in active])))
     if not candidate:
@@ -497,7 +495,7 @@ def mayring_process(
 
     active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, codebook_id, ("active", "proposed"), active_project_id))
+        chroma_categories, _load_categories(conn, None, ("active", "proposed"), active_project_id))
     try:
         res = _assign_or_create(
             conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
@@ -512,19 +510,17 @@ def mayring_process(
 
 
 def categorize_chunks(
-    items: list[tuple[str, str]], task: str, target_codebook_id: int, *,
+    items: list[tuple[str, str]], task: str, *,
     conn: Any, chroma_categories: Any,
     batch_embed_fn: BatchEmbedFn, batch_reduce_fn: BatchReduceFn,
-    match_codebook_id: int | None = None,
     codebook_version: int = 1, project_id: str | None = None,
 ) -> list[ProcessResult]:
     """Bulk-Pfad der EINEN Methode: dieselbe `_assign_or_create`-Logik wie mayring_process,
     aber die teure Reduktion + das Kandidaten-Embedding laufen GEBATCHT (eine LLM-Reduktion
     + ein Embed-Call pro Batch, über die zentrale PiQueue/cloud-split) statt pro Chunk.
-    Der deduktive Match ist CROSS-codebook (`match_codebook_id=None`) — das Embedding routet
-    den Chunk in seine Domäne, kein fragiles source_type→codebook-Mapping. Echte Neu-Kategorien
-    landen im `target_codebook_id` (aus der Domäne der Quelle aufgelöst). items = [(chunk_id, text)].
-    KEIN separater cosine-only-Pfad mehr — Bulk macht jetzt das volle goal-anchored Mayring."""
+    Der deduktive Match ist CROSS-codebook — das Embedding routet den Chunk selbst, KEIN
+    source_type→codebook-Routing. Echte Neu-Kategorien landen im EINEN Codebook
+    (_the_codebook_id). items = [(chunk_id, text)]."""
     if not items:
         return []
     if not (task or "").strip():
@@ -538,13 +534,14 @@ def categorize_chunks(
     if len(embs) != len(candidates):
         raise ValueError("categorize_chunks: Embedding-Anzahl != Kandidaten-Anzahl")
 
+    target_codebook_id = _the_codebook_id(conn)
     threshold = _promote_threshold(conn, target_codebook_id)
     # active (deduktiver Match) + dedup (active+proposed) EINMAL pro Batch laden; neue
     # Kategorien werden von _assign_or_create in-place angehängt → intra-batch sichtbar.
     active_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, match_codebook_id, ("active",), project_id))
+        chroma_categories, _load_categories(conn, None, ("active",), project_id))
     dedup_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, match_codebook_id, ("active", "proposed"), project_id))
+        chroma_categories, _load_categories(conn, None, ("active", "proposed"), project_id))
     out: list[ProcessResult] = []
     # Per-Chunk committen: hält den SQLite-Write-Lock NICHT über den ganzen Batch + alle
     # Chroma-Upserts; rollback bei Fehler, damit NIE eine offene Transaktion leakt (sonst
@@ -600,73 +597,61 @@ def _parse_structured(raw: str) -> tuple[str, str, str]:
     return "", "", _clean_label(raw)
 
 
+def _structured_reduce_prompt(text: str, theme: str,
+                              example_categories: list[str] | None) -> str:
+    """Reduktion → JSON {paraphrase, generalization, label}. Dieselben drei Mayring-
+    Schritte wie reduce_prompt, nur dass Paraphrase + Generalisierung mit zurückkommen
+    (sie SIND die Methode), nicht nur das Endlabel."""
+    return _reduce_head(text, theme, example_categories) + (
+        'Antworte NUR mit JSON: {"paraphrase":"...","generalization":"...",'
+        '"label":"<snake_case>"} — kein Markdown, keine Prosa.')
+
+
 def mayring_reduce(
-    text: str, theme: str, codebook_id: int, *,
+    text: str, theme: str, *,
     conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
-    mode: str = "hybrid", reduce: bool = True, structured: bool = False,
-    top_n: int = 1, chunk_id: str | None = None, codebook_version: int = 1,
-    project_id: str | None = None, match_codebook_id: int | None = None,
+    chunk_id: str | None = None, codebook_version: int = 1,
+    project_id: str | None = None,
 ) -> ReduceResult:
-    """Die EINE Mayring-Primitive. Zwei orthogonale Achsen:
-      mode   — Zuordnungsverhalten (inductive|deductive|hybrid), formt nur reduce_prompt.
-      reduce — True: LLM-Reduktion + cosine 0.70/0.92 (_assign_or_create, interaktiv/Einzel).
-               False: KEIN LLM — der Text selbst wird embedded und rein deduktiv (>=0.55)
-               gegen aktive Kategorien gematcht (Bulk-Ingest-Tier, #330/§5.1: NIE ans LLM koppeln).
-    match_codebook_id steuert den MATCH-Scope (None = cross-codebook); echte Neu-Kategorien
-    (reduce=True, induktiv) schreibt _assign_or_create dagegen ins WRITE-Target = match_codebook_id
-    falls gesetzt, sonst codebook_id. Match cross-codebook + Write nach codebook_id ist gewollt.
-    Liefert paraphrase/generalization (nur bei reduce+structured) + candidates.
-    Raises ValueError bei leerem text/theme (fail-closed)."""
+    """Die EINE Mayring-Methode (mixed, immer, domänenunabhängig): Ziel → Paraphrase →
+    Generalisierung → Reduktion → cosine gegen ALLE aktiven Kategorien. Treffer >=0.70:
+    bestehende nutzen (deduktive Hälfte); sonst Dedup >0.92, sonst neu bilden (induktive
+    Hälfte) — die Entscheidung trifft der Code (_assign_or_create), nicht das LLM. Es gibt
+    KEINEN Modus (deduktiv/induktiv = zwei Hälften derselben Methode) und KEIN codebook_id:
+    es gibt nur DAS eine Codebook (_the_codebook_id), neue Kategorien landen dort.
+    Liefert immer paraphrase + generalization + candidates[0] (die EINE Kategorie).
+    Raises ValueError bei leerem text/theme bzw. fehlgeschlagener Reduktion (fail-closed).
+    Bulk-Verlinkung OHNE LLM ist NICHT diese Funktion — das ist link_chunks_deductive
+    (hängt Chunks an bereits gebildete Kategorien, erstellt keine; #330). Siehe
+    [[feedback-mayring-canonical-method]]."""
     if not (text or "").strip():
         raise ValueError("mayring_reduce: 'text' required (fail-closed)")
     if not (theme or "").strip():
         raise ValueError("mayring_reduce: 'theme' required — Zielbezug obligatorisch")
 
-    active = _load_categories(conn, match_codebook_id, ("active",), project_id)
-    active_pairs = _category_embeddings(chroma_categories, active)
-
-    # reduce=False: LLM-freier deduktiver Tier (Bulk, #330/§5.1) -------------------------
-    if not reduce:
-        text_emb = embed_fn(text[:1200])
-        if not text_emb:
-            return ReduceResult("", "", [])
-        matches = _best_matches(list(text_emb), active_pairs, top_n=max(1, top_n),
-                                min_score=_HYBRID_MIN)
-        cands = [Candidate(c["name"], "deductive", round(s, 4), c["id"]) for c, s in matches]
-        if chunk_id:
-            for c, s in matches:
-                _link_chunk(conn, chunk_id, c["id"], version=codebook_version,
-                            confidence=s, source="deductive")
-            conn.commit()
-        return ReduceResult("", "", cands)
-
-    # reduce=True: LLM-Reduktion + _assign_or_create ------------------------------------
-    raw = llm_fn(reduce_prompt(text, theme, [c["name"] for c in active],
-                               mode=mode, structured=structured))
-    if structured:
-        paraphrase, generalization, candidate = _parse_structured(raw)
-    else:
-        paraphrase, generalization, candidate = "", "", _clean_label(raw)
+    active = _load_categories(conn, None, ("active",), project_id)
+    paraphrase, generalization, candidate = _parse_structured(
+        llm_fn(_structured_reduce_prompt(text, theme, [c["name"] for c in active])))
     if not candidate:
         raise ValueError("mayring_reduce: Reduktion lieferte kein Label (fail-closed)")
     candidate_emb = embed_fn(candidate)
     if not candidate_emb:
         raise ValueError("mayring_reduce: embedding fehlgeschlagen (fail-closed)")
 
+    codebook_id = _the_codebook_id(conn)
+    active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
-        chroma_categories,
-        _load_categories(conn, match_codebook_id, ("active", "proposed"), project_id))
-    target = match_codebook_id if match_codebook_id is not None else codebook_id
+        chroma_categories, _load_categories(conn, None, ("active", "proposed"), project_id))
     try:
         res = _assign_or_create(
-            conn, chroma_categories, target, chunk_id, candidate, candidate_emb,
+            conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
             active_pairs, dedup_pairs, task=theme, codebook_version=codebook_version,
-            project_id=project_id, promote_threshold=_promote_threshold(conn, target))
+            project_id=project_id, promote_threshold=_promote_threshold(conn, codebook_id))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    cands = [Candidate(res.category_name or candidate,
-                       _DECISION_TO_MATCH.get(res.decision, "inductive"),
-                       res.confidence, res.category_id)]
-    return ReduceResult(paraphrase, generalization, cands)
+    return ReduceResult(paraphrase, generalization, [Candidate(
+        res.category_name or candidate,
+        _DECISION_TO_MATCH.get(res.decision, "inductive"),
+        res.confidence, res.category_id)])

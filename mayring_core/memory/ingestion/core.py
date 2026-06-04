@@ -153,19 +153,6 @@ def _batch_reduce_labels(items: list[tuple[str, str]], ollama_url: str,
     ]
 
 
-def _resolve_target_codebook_id(conn: Any, source_type: str) -> int:
-    """Wohin echte Neu-Kategorien geschrieben werden: das Basis-Codebook der Domäne
-    der Quelle (code→'generic', social→'sozialforschung'). Der deduktive Match bleibt
-    cross-codebook; nur das induktive Neu-Bilden braucht ein Ziel. Fallback 'generic'."""
-    from mayring_core.memory.ingestion.categorization import _SOURCE_TYPE_TO_CODEBOOK
-    domain = _SOURCE_TYPE_TO_CODEBOOK.get(source_type)
-    slug = {"code": "generic", "social": "sozialforschung"}.get(domain, "generic")
-    row = conn.execute("SELECT id FROM codebooks WHERE slug=?", (slug,)).fetchone()
-    if row is None:
-        row = conn.execute("SELECT id FROM codebooks ORDER BY id LIMIT 1").fetchone()
-    return int(row[0]) if row else 1
-
-
 def resolve_dedup(
     conn: Any,
     chunk: Chunk,
@@ -442,11 +429,10 @@ def ingest(
                 "ORDER BY evidence_count DESC LIMIT 30").fetchall()]
             results = categorize_chunks(
                 chunks_to_categorize, goal,
-                _resolve_target_codebook_id(conn, source.source_type),
                 conn=conn, chroma_categories=get_chroma_collection("codebook_categories"),
                 batch_embed_fn=lambda texts: _embed_batch(texts, ollama_url),
                 batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model, example_cats),
-                match_codebook_id=None, project_id=link_project_id)
+                project_id=link_project_id)
             category_links = sum(1 for r in results if r.category_id is not None)
             _log.info("mayring categorize: %d/%d chunks kategorisiert (source=%s, project=%s, ziel=%r)",
                       category_links, len(chunks_to_categorize), source.source_id,
