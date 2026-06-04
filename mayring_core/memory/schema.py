@@ -271,6 +271,12 @@ class RetrievalRecord:
     # v2-Trainer kann das Gewicht lernen (Phase B), nicht nur der
     # deterministische Boost (Phase A).
     score_cat_match: float = 0.0
+    # C3 v18 (project-scoped memory): 1.0 wenn der Chunk über chunk_project_links
+    # an das Session-Projekt geknüpft ist (sonst 0.0). Triggert einen
+    # DETERMINISTISCHEN Boost (_PROJECT_MATCH_BOOST) — KEIN harter Filter,
+    # global/unverlinktes Wissen bleibt immer sichtbar. Bewusst NICHT als
+    # gelerntes Reranker-Feature (cat_match-Lehre: trainiert negativ → schädlich).
+    score_project_match: float = 0.0
     score_final: float = 0.0
     # Issue #185/#182 follow-up: rationale-edges aus wiki_v2 für diesen chunk.
     # Liste von dicts {target, context, why} — wird im compress_for_prompt
@@ -294,6 +300,7 @@ class RetrievalRecord:
             "score_llm": round(self.score_llm, 4),
             "score_predicted_topic": round(self.score_predicted_topic, 4),
             "score_cat_match": round(self.score_cat_match, 4),
+            "score_project_match": round(self.score_project_match, 4),
             "score_final": round(self.score_final, 4),
             "rationale_edges": self.rationale_edges,
             "reasons": self.reasons,

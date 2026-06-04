@@ -88,3 +88,50 @@ def test_link_and_bulk_lookup_idempotent_and_ws_isolated():
         # Empty inputs short-circuit.
         assert project_linked_chunk_ids(conn, [], "projX", ws) == set()
         assert project_linked_chunk_ids(conn, [c1], "", ws) == set()
+
+
+def test_rerank_project_boost_is_additive_not_a_wall():
+    """A linked candidate gets +_PROJECT_MATCH_BOOST; an unlinked one stays in
+    the result (global/unlinked knowledge is NEVER hidden) with project_match 0."""
+    from mayring_core.memory.retrieval import _rerank, _PROJECT_MATCH_BOOST
+    with tempfile.TemporaryDirectory() as d:
+        conn = init_memory_db(Path(d) / "m.db")
+        ws = "ws-a"
+        linked_id = _seed_chunk(conn, "src:linked", workspace_id=ws)
+        global_id = _seed_chunk(conn, "src:global", workspace_id=ws)
+        link_chunk_to_project(conn, linked_id, "projX", workspace_id=ws)
+
+        from mayring_core.memory.store import get_chunk
+        candidates = [get_chunk(conn, linked_id), get_chunk(conn, global_id)]
+        # Identical base signals so the ONLY differentiator is the project boost.
+        vec = {linked_id: 0.4, global_id: 0.4}
+        sym = {linked_id: 0.4, global_id: 0.4}
+
+        records = _rerank(
+            candidates, vec, sym, top_k=10, conn=conn,
+            project_id="projX", workspace_id=ws,
+        )
+        by_id = {r.chunk_id: r for r in records}
+        # Both present — boost is additive, not a filter wall.
+        assert linked_id in by_id
+        assert global_id in by_id
+
+        assert by_id[linked_id].score_project_match > 0.0
+        assert by_id[global_id].score_project_match == 0.0
+        assert by_id[linked_id].score_final > by_id[global_id].score_final
+        # The delta is exactly the deterministic boost (same base signals).
+        delta = by_id[linked_id].score_final - by_id[global_id].score_final
+        assert abs(delta - _PROJECT_MATCH_BOOST) < 1e-9
+
+
+def test_rerank_no_project_id_no_boost():
+    from mayring_core.memory.retrieval import _rerank
+    with tempfile.TemporaryDirectory() as d:
+        conn = init_memory_db(Path(d) / "m.db")
+        ws = "ws-a"
+        cid = _seed_chunk(conn, "src:1", workspace_id=ws)
+        link_chunk_to_project(conn, cid, "projX", workspace_id=ws)
+        from mayring_core.memory.store import get_chunk
+        records = _rerank([get_chunk(conn, cid)], {cid: 0.4}, {cid: 0.4},
+                          top_k=10, conn=conn)
+        assert records[0].score_project_match == 0.0
