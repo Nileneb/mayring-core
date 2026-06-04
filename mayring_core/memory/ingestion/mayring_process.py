@@ -327,14 +327,29 @@ def _granularity_hint(example_categories: list[str] | None) -> str:
     )
 
 
+def _mode_clause(mode: str) -> str:
+    """Steuert NUR den Zuordnungs-/Neubildungs-Teil. Die cosine-Entscheidung
+    macht weiterhin der Code (_assign_or_create), nicht das LLM — der Modus
+    formt nur, wie frei das Label gebildet werden darf."""
+    if mode == "deductive":
+        return ("Bilde KEINE neue Kategorie: wähle das Label so, dass es eine "
+                "der bestehenden Kategorien trifft (deduktiv).\n")
+    if mode == "inductive":
+        return ("Bilde das Label FREI aus dem Text (induktiv); die Beispiele "
+                "geben nur das Granularitätsniveau vor.\n")
+    return ("Triff wenn möglich eine bestehende Kategorie, sonst bilde eine "
+            "neue auf gleichem Granularitätsniveau (hybrid).\n")
+
+
 def reduce_prompt(text: str, task: str,
-                  example_categories: list[str] | None = None) -> str:
+                  example_categories: list[str] | None = None,
+                  mode: str = "hybrid", structured: bool = False) -> str:
     """Mayrings Reduktion als Prompt: aus Rohtext, GEBUNDEN AN DAS ZIEL, über
-    Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. Der Zielbezug ist
-    obligatorisch (sonst random Kategorien). example_categories kalibrieren die
-    Generalisierung aufs Abstraktionsniveau der Bestands-Kategorien (mehr Merging).
+    Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. `mode` steuert
+    nur das Zuordnungsverhalten (deduktiv/induktiv/hybrid), nicht den cosine-Schritt.
+    `structured=True` → JSON mit paraphrase+generalization+label (für pi_summarize).
     Siehe [[feedback-mayring-canonical-method]]."""
-    return (
+    head = (
         "Du bildest eine Kategorie nach qualitativer Inhaltsanalyse (Mayring).\n"
         f"ZIEL/Aufgabe (obligatorischer Bezug): {task[:300]}\n"
         f"Textstelle:\n{text[:1200]}\n\n"
@@ -344,9 +359,15 @@ def reduce_prompt(text: str, task: str,
         "(breiter Konzept-Typ, nicht der Einzelfall).\n"
         "3. REDUKTION: verdichte zu EINER prägnanten Kategorie (snake_case, max 4 Wörter), "
         "die den Bezug zum Ziel wahrt.\n"
+        f"{_mode_clause(mode)}"
         f"{_granularity_hint(example_categories)}"
-        "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
     )
+    if structured:
+        return head + (
+            'Antworte NUR mit JSON: {"paraphrase":"...","generalization":"...",'
+            '"label":"<snake_case>"} — kein Markdown, keine Prosa.'
+        )
+    return head + "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
 
 
 def _promote_threshold(conn: Any, codebook_id: int) -> int:
