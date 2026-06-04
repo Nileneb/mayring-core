@@ -299,7 +299,7 @@ def ingest(
     # → cosine 0.75 → vorhandene nutzen, sonst induktiv neu. KEIN separater cheap
     # cosine-only-Pfad mehr. Die free-string category_labels bleiben FK-abgeleitet
     # (eine SoT chunk_categories). Siehe [[feedback-mayring-canonical-method]].
-    _ = (do_categorize, mode, codebook_choice)  # legacy flags, von categorize_chunks ersetzt
+    _ = (mode, codebook_choice)  # legacy flags, von categorize_chunks ersetzt (do_categorize gated nun den LLM-Pfad, #330)
 
     from mayring_core.memory.ingestion.conversation_filter import should_skip_chunk
 
@@ -420,7 +420,13 @@ def ingest(
     # keine, ein aus der Quelle abgeleiteter Anker — nie ganz ohne Bezug (sonst random).
     category_links = 0
     goal = categorize_task.strip() or f"Inhalte aus {source.source_type}: {source.path}"
-    if do_link and chunks_to_categorize and model:
+    # WHY(#330 categorize:false-no-LLM): gate the EXPENSIVE LLM mixed-method on
+    # do_categorize (= categorize-flag AND model present), NOT on do_link. A
+    # categorize:false ingest must NOT pay the ~40s LLM reduce — it falls through
+    # to the cheap deterministic deductive link (elif below). Previously this was
+    # gated on `do_link and model`, so categorize:false STILL ran the LLM path
+    # (slow → smoke 40s-timeout flake) instead of the intended LLM-free link.
+    if do_categorize and chunks_to_categorize:
         from mayring_core.memory.ingestion.mayring_process import categorize_chunks
         from mayring_core.memory.store import get_chroma_collection
         from mayring_core.providers import embed_texts as _embed_batch
