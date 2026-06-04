@@ -62,11 +62,11 @@ def test_deductive_link_runs_without_llm_model(monkeypatch, tmp_path):
         chroma_collection=_FakeCollection(),
         ollama_url="http://localhost:11434",
         model="",  # NO LLM model — must still link via the deductive path
-        opts={"categorize": False, "link_categories": True},
+        opts={"categorize": False},
     )
 
     assert "chunk_embs" in captured, (
-        "link_chunks_deductive must run when do_link is on and no model is available"
+        "link_chunks_deductive must run when no model is available (linking is always on)"
     )
     assert all(e for _, e in captured["chunk_embs"]), "embeddings must be passed through"
     assert result["category_links"] >= 1, "category_links must reflect the deductive links"
@@ -106,36 +106,7 @@ def test_categorize_false_uses_cheap_deductive_not_llm(monkeypatch, tmp_path):
         source=source, content="auth login jwt flow", conn=db_conn,
         chroma_collection=_FakeCollection(), ollama_url="http://localhost:11434",
         model="real-text-model",  # model PRESENT, but categorize is OFF
-        opts={"categorize": False, "link_categories": True},
+        opts={"categorize": False},
     )
     assert flags["deductive"] is True, "categorize=False must use the cheap deductive link"
     assert flags["llm"] is False, "categorize=False must NOT invoke the LLM categorize_chunks"
-
-
-def test_no_link_when_link_categories_disabled(monkeypatch, tmp_path):
-    """do_link=False → neither path runs → 0 links (no accidental linking)."""
-    fake_emb = [0.1] * 384
-    import mayring_core.providers as _providers
-    monkeypatch.setattr(_providers, "embed_texts", lambda texts, url: [fake_emb] * len(texts))
-    import mayring_core.memory.ingestion.conversation_filter as _cf
-    monkeypatch.setattr(_cf, "should_skip_chunk", lambda text, stype: (False, ""))
-
-    ran = {"called": False}
-    import mayring_core.memory.ingestion.mayring_process as _mp
-
-    def _fake_link(*a, **k):
-        ran["called"] = True
-        return 0
-
-    monkeypatch.setattr(_mp, "link_chunks_deductive", _fake_link)
-
-    db_conn = init_memory_db(tmp_path / "memory.db")
-    source = Source(source_id="test:o/r:x.py", source_type="repo_file",
-                    repo="o/r", path="x.py", visibility="private", user_id="u-7")
-    result = ingest(
-        source=source, content="some content here", conn=db_conn,
-        chroma_collection=_FakeCollection(), ollama_url="http://localhost:11434",
-        model="", opts={"categorize": False, "link_categories": False},
-    )
-    assert ran["called"] is False
-    assert result["category_links"] == 0

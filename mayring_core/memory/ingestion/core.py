@@ -262,7 +262,10 @@ def ingest(
     # to its closest active codebook category (deductive, LLM-free) → fills
     # chunk_categories for the reranker. Scope = shared base ∪ this project's own.
     link_project_id = effective.get("project_id") or None
-    do_link: bool = bool(effective.get("link_categories", True))
+    # Category linking is ALWAYS on — it feeds reranker cat_match / IGIO / wiki /
+    # display and is cheap (deterministic deductive, no LLM). There is no valid
+    # reason to ingest a chunk without linking it, so the old `link_categories`
+    # opt-out flag was removed (it was dead config — no caller ever set it False).
 
     from mayring_core.providers import embed_texts as _embed_texts
 
@@ -481,7 +484,7 @@ def ingest(
                              source.source_id)
             _log.warning("category-link failed (source=%s): %s",
                          source.source_id, exc)
-    elif do_link and chunks_to_categorize:
+    elif chunks_to_categorize:
         # WHY(#330 deductive-no-LLM): when no text model is available (categorize
         # off, or model unavailable) the full mixed-method above is skipped — but
         # reranker-v3 cat_match still needs chunk_categories. Use the cheap,
