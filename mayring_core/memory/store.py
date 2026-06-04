@@ -1316,6 +1316,63 @@ def insert_chunk(
     _maybe_commit(conn)
 
 
+def link_chunk_to_project(
+    conn: DBAdapter,
+    chunk_id: str,
+    project_id: str,
+    *,
+    origin_ref: str = "",
+    source: str = "",
+    workspace_id: str,
+    created_at: str | None = None,
+) -> None:
+    """Link a chunk to a project (C3 v18, 1-to-many via chunk_project_links).
+
+    Idempotent: the PK is (chunk_id, project_id), so a repeated link is a
+    no-op via INSERT OR IGNORE. origin_ref is nested-repo-aware (which
+    sub-project a chunk belongs to inside a monorepo); source records HOW the
+    link was made (e.g. 'ingest', 'manual').
+    """
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO chunk_project_links
+            (chunk_id, project_id, origin_ref, source, workspace_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (chunk_id, project_id, origin_ref, source, workspace_id,
+         created_at or _now_iso()),
+    )
+    _maybe_commit(conn)
+
+
+def project_linked_chunk_ids(
+    conn: DBAdapter,
+    chunk_ids: list[str],
+    project_id: str,
+    workspace_id: str,
+) -> set[str]:
+    """Return the subset of chunk_ids linked to project_id within workspace_id.
+
+    One bulk query (workspace-scoped). Empty chunk_ids or empty project_id
+    short-circuit to an empty set. Used by retrieval for the deterministic
+    project_match boost — NOT a hard filter.
+    """
+    if not chunk_ids or not project_id:
+        return set()
+    out: set[str] = set()
+    BATCH = 900  # stay under SQLite's 999 variable limit (+2 fixed params)
+    for i in range(0, len(chunk_ids), BATCH):
+        batch = chunk_ids[i:i + BATCH]
+        ph = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT chunk_id FROM chunk_project_links "
+            f"WHERE project_id = ? AND workspace_id = ? AND chunk_id IN ({ph})",
+            (project_id, workspace_id, *batch),
+        ).fetchall()
+        out.update(r[0] for r in rows)
+    return out
+
+
 def get_chunk(conn: DBAdapter, chunk_id: str, active_only: bool = True) -> Chunk | None:
     query = "SELECT * FROM chunks WHERE chunk_id = ?"
     if active_only:
