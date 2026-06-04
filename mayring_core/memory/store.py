@@ -131,7 +131,12 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       Absence of a row means the DEFAULT_MATRIX from authz.py applies.
 #   v17 (C1 project-groups): project_groups table (named, colored groups per
 #       workspace) + projects.group_id FK column.
-CURRENT_SCHEMA_VERSION = 17
+#   v18 (C3 project-scoped memory): chunk_project_links table — 1-to-many
+#       chunk↔project links (origin_ref is nested-repo-aware). Retires the
+#       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
+#       favour of a deterministic project_match boost (the chunks.project_id
+#       column stays DORMANT, not dropped). No backfill.
+CURRENT_SCHEMA_VERSION = 18
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -743,6 +748,28 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_project_groups_workspace
             ON project_groups(workspace_id);
+
+        -- C3 (project-scoped memory v18): 1-to-many chunk↔project links.
+        -- origin_ref is nested-repo-aware (e.g. a submodule path that pins
+        -- WHICH project a chunk belongs to inside a monorepo). source records
+        -- HOW the link was made (ingest, manual, …). Inject priorises the
+        -- session project via a DETERMINISTIC boost (retrieval._PROJECT_MATCH_
+        -- BOOST), never a hard filter — global/unlinked knowledge stays visible.
+        -- NOTE: indexes are inline-safe here because the table is entirely new
+        -- in v18 — no pre-v18 DB has it, so CREATE TABLE is a real create.
+        CREATE TABLE IF NOT EXISTS chunk_project_links (
+            chunk_id      TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+            project_id    TEXT NOT NULL,
+            origin_ref    TEXT NOT NULL DEFAULT '',
+            source        TEXT NOT NULL DEFAULT '',
+            workspace_id  TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, project_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_project_links_ws_project
+            ON chunk_project_links(workspace_id, project_id);
+        CREATE INDEX IF NOT EXISTS idx_chunk_project_links_chunk
+            ON chunk_project_links(chunk_id);
 
         -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
         -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
