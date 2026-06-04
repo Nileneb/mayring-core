@@ -10,6 +10,7 @@ See docs/superpowers/specs/2026-05-24-phase3-mayring-process.md.
 """
 from __future__ import annotations
 
+import json as _json_mod
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -563,9 +564,6 @@ def categorize_chunks(
     return out
 
 
-import json as _json_mod  # noqa: E402  — placed here to avoid top-level cycle risk
-
-
 @dataclass
 class Candidate:
     label: str
@@ -614,6 +612,9 @@ def mayring_reduce(
       reduce — True: LLM-Reduktion + cosine 0.70/0.92 (_assign_or_create, interaktiv/Einzel).
                False: KEIN LLM — der Text selbst wird embedded und rein deduktiv (>=0.55)
                gegen aktive Kategorien gematcht (Bulk-Ingest-Tier, #330/§5.1: NIE ans LLM koppeln).
+    match_codebook_id steuert den MATCH-Scope (None = cross-codebook); echte Neu-Kategorien
+    (reduce=True, induktiv) schreibt _assign_or_create dagegen ins WRITE-Target = match_codebook_id
+    falls gesetzt, sonst codebook_id. Match cross-codebook + Write nach codebook_id ist gewollt.
     Liefert paraphrase/generalization (nur bei reduce+structured) + candidates.
     Raises ValueError bei leerem text/theme (fail-closed)."""
     if not (text or "").strip():

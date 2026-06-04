@@ -116,10 +116,14 @@ def test_reduce_false_multilabel_top_n(tmp_path):
     )
     conn.commit()
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0], "cb:2": [0.9, 0.1, 0.0]})
+
+    def _boom(_p):
+        raise AssertionError("LLM must NOT be called when reduce=False, even top_n>1 (#330/§5.1)")
+
     res = mayring_reduce(
         "auth and routing", theme="backend", codebook_id=1, conn=conn,
         chroma_categories=chroma, embed_fn=lambda s: [0.97, 0.05, 0.0],
-        llm_fn=lambda p: "x", reduce=False, top_n=2,
+        llm_fn=_boom, reduce=False, top_n=2,
     )
     labels = {c.label for c in res.candidates}
     assert labels == {"auth", "api"}
