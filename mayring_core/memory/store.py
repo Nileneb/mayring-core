@@ -126,7 +126,20 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       tightens the sources.visibility CHECK to ('private','org','public').
 #       Runs at boot via migrate_visibility_axis() before the new scope_filter
 #       ships -> no search blackout.
-CURRENT_SCHEMA_VERSION = 16
+#   v16 (tenancy phase B): workspace_role_permissions table — per-workspace
+#       role permission overrides (user/editor/admin × permission → allowed).
+#       Absence of a row means the DEFAULT_MATRIX from authz.py applies.
+#   v17 (C1 project-groups): project_groups table (named, colored groups per
+#       workspace) + projects.group_id FK column.
+CURRENT_SCHEMA_VERSION = 17
+
+# C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
+# Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
+# pro Gruppe gespeicherte Hex-Farbe, nicht diese Liste.
+PROJECT_GROUP_PALETTE = [
+    "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899",
+    "#14b8a6", "#ef4444", "#6366f1", "#84cc16",
+]
 
 
 def _now_iso() -> str:
@@ -262,6 +275,8 @@ def _migrate_schema(conn: DBAdapter) -> None:
             ("owner_id", "TEXT"),
             ("source_type", "TEXT"),
             ("source_ref", "TEXT"),
+            # C1 (project-groups v17): FK→project_groups.id, NULL = keine Gruppe.
+            ("group_id", "TEXT DEFAULT NULL"),
         ],
         # v2 Phase 3.2 (project-scoped codebook): NULL = geteilte Profil-Basis
         # (imported), gesetzt = projekt-spezifisch induziert. Der aktive
@@ -712,6 +727,22 @@ def _init_schema(conn: DBAdapter) -> None:
         -- created AFTER _migrate_schema() below — on a pre-v8 DB those columns
         -- are back-filled there via ALTER, so an inline CREATE INDEX here crashed
         -- legacy DBs with "no such column: source_type".
+
+        -- C1 (project-groups v17): named, colored project groups per workspace.
+        -- group_id on projects is FK→project_groups.id (NULL = no group).
+        -- NOTE: idx_project_groups_workspace is inline-safe here because this
+        -- table is entirely new in v17 — no pre-v17 DB has it, so CREATE TABLE
+        -- IF NOT EXISTS is a real create, not a no-op.
+        CREATE TABLE IF NOT EXISTS project_groups (
+            id            TEXT PRIMARY KEY,
+            workspace_id  TEXT NOT NULL,
+            name          TEXT NOT NULL,
+            color         TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_project_groups_workspace
+            ON project_groups(workspace_id);
 
         -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
         -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
