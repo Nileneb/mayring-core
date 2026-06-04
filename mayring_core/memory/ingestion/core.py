@@ -475,6 +475,47 @@ def ingest(
                              source.source_id)
             _log.warning("category-link failed (source=%s): %s",
                          source.source_id, exc)
+    elif do_link and chunks_to_categorize:
+        # WHY(#330 deductive-no-LLM): when no text model is available (categorize
+        # off, or model unavailable) the full mixed-method above is skipped — but
+        # reranker-v3 cat_match still needs chunk_categories. Use the cheap,
+        # deterministic, LLM-free deductive link (best codebook category per chunk
+        # >= threshold) on the embeddings we already computed for the vector store.
+        # Production paths that DO pass a model keep the richer categorize_chunks
+        # branch untouched. Fail-soft + rollback like the branch above.
+        from mayring_core.memory.ingestion.mayring_process import (
+            link_chunks_deductive, derive_labels_from_categories)
+        from mayring_core.memory.store import get_chroma_collection
+        try:
+            chunk_embs = [(cid, embeddings.get(cid)) for cid, _ in chunks_to_categorize
+                          if embeddings.get(cid)]
+            category_links = link_chunks_deductive(
+                conn, get_chroma_collection("codebook_categories"),
+                chunk_embs, project_id=link_project_id)
+            label_map = derive_labels_from_categories(conn, new_chunk_ids)
+            for cid, labels in label_map.items():
+                top = labels[:5]
+                conn.execute(
+                    "UPDATE chunks SET category_labels = ?, category_source = 'deductive-link' "
+                    "WHERE chunk_id = ? AND is_active = 1",
+                    (",".join(top), cid),
+                )
+                cached = kv_get(cid)
+                if cached is not None:
+                    cached["category_labels"] = top
+                    cached["category_source"] = "deductive-link"
+                    kv_put(cid, cached)
+            conn.commit()
+            _log.info("deductive link (no-LLM): %d/%d chunks linked (source=%s, project=%s)",
+                      category_links, len(chunk_embs), source.source_id, link_project_id)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 — rollback best-effort, not swallowed
+                _log.warning("rollback after deductive-link failure also failed (source=%s)",
+                             source.source_id)
+            _log.warning("deductive-link (no-LLM) failed (source=%s): %s",
+                         source.source_id, exc)
 
     result = {
         "source_id": source.source_id,
