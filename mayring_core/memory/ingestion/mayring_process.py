@@ -10,6 +10,7 @@ See docs/superpowers/specs/2026-05-24-phase3-mayring-process.md.
 """
 from __future__ import annotations
 
+import json as _json_mod
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -327,14 +328,29 @@ def _granularity_hint(example_categories: list[str] | None) -> str:
     )
 
 
+def _mode_clause(mode: str) -> str:
+    """Steuert NUR den Zuordnungs-/Neubildungs-Teil. Die cosine-Entscheidung
+    macht weiterhin der Code (_assign_or_create), nicht das LLM — der Modus
+    formt nur, wie frei das Label gebildet werden darf."""
+    if mode == "deductive":
+        return ("Bilde KEINE neue Kategorie: wähle das Label so, dass es eine "
+                "der bestehenden Kategorien trifft (deduktiv).\n")
+    if mode == "inductive":
+        return ("Bilde das Label FREI aus dem Text (induktiv); die Beispiele "
+                "geben nur das Granularitätsniveau vor.\n")
+    return ("Triff wenn möglich eine bestehende Kategorie, sonst bilde eine "
+            "neue auf gleichem Granularitätsniveau (hybrid).\n")
+
+
 def reduce_prompt(text: str, task: str,
-                  example_categories: list[str] | None = None) -> str:
+                  example_categories: list[str] | None = None,
+                  mode: str = "hybrid", structured: bool = False) -> str:
     """Mayrings Reduktion als Prompt: aus Rohtext, GEBUNDEN AN DAS ZIEL, über
-    Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. Der Zielbezug ist
-    obligatorisch (sonst random Kategorien). example_categories kalibrieren die
-    Generalisierung aufs Abstraktionsniveau der Bestands-Kategorien (mehr Merging).
+    Paraphrase→Generalisierung→Reduktion EINE Kategorie ableiten. `mode` steuert
+    nur das Zuordnungsverhalten (deduktiv/induktiv/hybrid), nicht den cosine-Schritt.
+    `structured=True` → JSON mit paraphrase+generalization+label (für pi_summarize).
     Siehe [[feedback-mayring-canonical-method]]."""
-    return (
+    head = (
         "Du bildest eine Kategorie nach qualitativer Inhaltsanalyse (Mayring).\n"
         f"ZIEL/Aufgabe (obligatorischer Bezug): {task[:300]}\n"
         f"Textstelle:\n{text[:1200]}\n\n"
@@ -344,9 +360,15 @@ def reduce_prompt(text: str, task: str,
         "(breiter Konzept-Typ, nicht der Einzelfall).\n"
         "3. REDUKTION: verdichte zu EINER prägnanten Kategorie (snake_case, max 4 Wörter), "
         "die den Bezug zum Ziel wahrt.\n"
+        f"{_mode_clause(mode)}"
         f"{_granularity_hint(example_categories)}"
-        "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
     )
+    if structured:
+        return head + (
+            'Antworte NUR mit JSON: {"paraphrase":"...","generalization":"...",'
+            '"label":"<snake_case>"} — kein Markdown, keine Prosa.'
+        )
+    return head + "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes."
 
 
 def _promote_threshold(conn: Any, codebook_id: int) -> int:
@@ -540,3 +562,111 @@ def categorize_chunks(
         conn.rollback()
         raise
     return out
+
+
+@dataclass
+class Candidate:
+    label: str
+    match: str          # deductive | dedup | inductive
+    score: float
+    category_id: int | None = None
+
+
+@dataclass
+class ReduceResult:
+    paraphrase: str
+    generalization: str
+    candidates: list[Candidate]
+
+
+_DECISION_TO_MATCH = {
+    "deductive": "deductive",
+    "inductive-dedup": "dedup",
+    "inductive": "inductive",
+}
+
+
+def _parse_structured(raw: str) -> tuple[str, str, str]:
+    """JSON {paraphrase,generalization,label} → (paraphrase, generalization, clean label).
+    Fail-soft: kein JSON → ('', '', _clean_label(raw))."""
+    try:
+        obj = _json_mod.loads(raw)
+        if isinstance(obj, dict):
+            return (str(obj.get("paraphrase", "")).strip(),
+                    str(obj.get("generalization", "")).strip(),
+                    _clean_label(str(obj.get("label", ""))))
+    except (ValueError, TypeError):
+        pass
+    return "", "", _clean_label(raw)
+
+
+def mayring_reduce(
+    text: str, theme: str, codebook_id: int, *,
+    conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
+    mode: str = "hybrid", reduce: bool = True, structured: bool = False,
+    top_n: int = 1, chunk_id: str | None = None, codebook_version: int = 1,
+    project_id: str | None = None, match_codebook_id: int | None = None,
+) -> ReduceResult:
+    """Die EINE Mayring-Primitive. Zwei orthogonale Achsen:
+      mode   — Zuordnungsverhalten (inductive|deductive|hybrid), formt nur reduce_prompt.
+      reduce — True: LLM-Reduktion + cosine 0.70/0.92 (_assign_or_create, interaktiv/Einzel).
+               False: KEIN LLM — der Text selbst wird embedded und rein deduktiv (>=0.55)
+               gegen aktive Kategorien gematcht (Bulk-Ingest-Tier, #330/§5.1: NIE ans LLM koppeln).
+    match_codebook_id steuert den MATCH-Scope (None = cross-codebook); echte Neu-Kategorien
+    (reduce=True, induktiv) schreibt _assign_or_create dagegen ins WRITE-Target = match_codebook_id
+    falls gesetzt, sonst codebook_id. Match cross-codebook + Write nach codebook_id ist gewollt.
+    Liefert paraphrase/generalization (nur bei reduce+structured) + candidates.
+    Raises ValueError bei leerem text/theme (fail-closed)."""
+    if not (text or "").strip():
+        raise ValueError("mayring_reduce: 'text' required (fail-closed)")
+    if not (theme or "").strip():
+        raise ValueError("mayring_reduce: 'theme' required — Zielbezug obligatorisch")
+
+    active = _load_categories(conn, match_codebook_id, ("active",), project_id)
+    active_pairs = _category_embeddings(chroma_categories, active)
+
+    # reduce=False: LLM-freier deduktiver Tier (Bulk, #330/§5.1) -------------------------
+    if not reduce:
+        text_emb = embed_fn(text[:1200])
+        if not text_emb:
+            return ReduceResult("", "", [])
+        matches = _best_matches(list(text_emb), active_pairs, top_n=max(1, top_n),
+                                min_score=_HYBRID_MIN)
+        cands = [Candidate(c["name"], "deductive", round(s, 4), c["id"]) for c, s in matches]
+        if chunk_id:
+            for c, s in matches:
+                _link_chunk(conn, chunk_id, c["id"], version=codebook_version,
+                            confidence=s, source="deductive")
+            conn.commit()
+        return ReduceResult("", "", cands)
+
+    # reduce=True: LLM-Reduktion + _assign_or_create ------------------------------------
+    raw = llm_fn(reduce_prompt(text, theme, [c["name"] for c in active],
+                               mode=mode, structured=structured))
+    if structured:
+        paraphrase, generalization, candidate = _parse_structured(raw)
+    else:
+        paraphrase, generalization, candidate = "", "", _clean_label(raw)
+    if not candidate:
+        raise ValueError("mayring_reduce: Reduktion lieferte kein Label (fail-closed)")
+    candidate_emb = embed_fn(candidate)
+    if not candidate_emb:
+        raise ValueError("mayring_reduce: embedding fehlgeschlagen (fail-closed)")
+
+    dedup_pairs = _category_embeddings(
+        chroma_categories,
+        _load_categories(conn, match_codebook_id, ("active", "proposed"), project_id))
+    target = match_codebook_id if match_codebook_id is not None else codebook_id
+    try:
+        res = _assign_or_create(
+            conn, chroma_categories, target, chunk_id, candidate, candidate_emb,
+            active_pairs, dedup_pairs, task=theme, codebook_version=codebook_version,
+            project_id=project_id, promote_threshold=_promote_threshold(conn, target))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    cands = [Candidate(res.category_name or candidate,
+                       _DECISION_TO_MATCH.get(res.decision, "inductive"),
+                       res.confidence, res.category_id)]
+    return ReduceResult(paraphrase, generalization, cands)
