@@ -126,6 +126,11 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       tightens the sources.visibility CHECK to ('private','org','public').
 #       Runs at boot via migrate_visibility_axis() before the new scope_filter
 #       ships -> no search blackout.
+#   v16 (tenancy phase B): workspace_role_permissions table — per-workspace
+#       role permission overrides (user/editor/admin × permission → allowed).
+#       Absence of a row means the DEFAULT_MATRIX from authz.py applies.
+#   v17 (C1 project-groups): project_groups table (named, colored groups per
+#       workspace) + projects.group_id FK column.
 CURRENT_SCHEMA_VERSION = 17
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
