@@ -425,7 +425,7 @@ def ingest(
             # cross-codebook (Match ist cross-codebook) → das LLM hebt das Label aufs
             # Niveau dieser Bestands-Kategorien (mehr Merging, weniger Fragmente).
             example_cats = [r[0] for r in conn.execute(
-                "SELECT name FROM codebook_categories WHERE status='active' AND embedding_id != '' "
+                "SELECT name FROM categories WHERE status='active' AND embedding_id != '' "
                 "ORDER BY evidence_count DESC LIMIT 30").fetchall()]
             results = categorize_chunks(
                 chunks_to_categorize, goal,

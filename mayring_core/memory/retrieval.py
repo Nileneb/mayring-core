@@ -611,16 +611,19 @@ def _rerank(
     # cat_match = (query categories ∩ a candidate's chunk_categories).
     query_cat_ids: set[int] = set(query_category_ids or ())
     chunk_cat_map: dict[str, set[int]] = {}
-    # Feature ist optional: ohne die Codebook-Tabellen (Minimal-/Alt-DB) bleibt es
-    # inaktiv (explizite Precondition, kein stilles except).
-    if (candidates
-            and _has_table(conn, "codebook_categories")
-            and _has_table(conn, "chunk_categories")):
+    # Feature ist optional: ohne die categories-Tabelle (Minimal-/Alt-DB) bleibt es
+    # inaktiv (explizite Precondition, kein stilles except). Fallback auf den alten
+    # Namen "codebook_categories" für DBs die noch nicht auf v19 migriert sind.
+    _cat_table = (
+        "categories" if _has_table(conn, "categories")
+        else ("codebook_categories" if _has_table(conn, "codebook_categories") else None)
+    )
+    if (candidates and _cat_table and _has_table(conn, "chunk_categories")):
         if not query_cat_ids and cat_hint_set:
             ph = ",".join("?" for _ in cat_hint_set)
             query_cat_ids = {
                 r[0] for r in conn.execute(
-                    f"SELECT id FROM codebook_categories WHERE lower(name) IN ({ph})",
+                    f"SELECT id FROM {_cat_table} WHERE lower(name) IN ({ph})",
                     tuple(cat_hint_set)).fetchall()
             }
         if query_cat_ids:
@@ -1171,11 +1174,13 @@ def search(
     igio_intent = opts.get("igio_intent") or detect_igio_intent(query)
     opts["_igio_intent"] = igio_intent  # für diagnostics
 
-    # Reranker-v3 (#270): derive the QUERY's codebook categories from its embedding
-    # so cat_match fires for EVERY search, not only when the caller passes
-    # category_hint (the session hook doesn't → cat_match was inert despite Phase
-    # 3.2 populating chunk_categories). Fail-soft: any miss leaves it empty (no
-    # behaviour change); category embeddings are cached off the per-search path.
+    # Reranker-v3 (#270): derive the QUERY's categories from its embedding so
+    # cat_match fires for EVERY search, not only when the caller passes category_hint
+    # (the session hook doesn't → cat_match was inert despite Phase 3.2 populating
+    # chunk_categories). Fail-soft: any miss leaves it empty (no behaviour change);
+    # category embeddings are cached off the per-search path.
+    # WHY(v19): Chroma-Collection heißt weiterhin "codebook_categories" (Back-Compat,
+    # Chroma-Collections nicht atomar umbenennbar ohne Datenverlust).
     query_category_ids: set[int] = set()
     if query_emb is not None:
         try:
