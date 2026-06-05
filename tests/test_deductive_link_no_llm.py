@@ -110,3 +110,33 @@ def test_categorize_false_uses_cheap_deductive_not_llm(monkeypatch, tmp_path):
     )
     assert flags["deductive"] is True, "categorize=False must use the cheap deductive link"
     assert flags["llm"] is False, "categorize=False must NOT invoke the LLM categorize_chunks"
+
+
+def test_categorize_logs_call_type_categorization(monkeypatch, tmp_path):
+    """Regression: der kanonische Ingest-Pfad MUSS call_type='categorization' loggen
+    (der einzige Live-Producer; früher tat das nur das tote mayring_categorize → der
+    Observability-Metric /stats/llm-call-types war leer)."""
+    fake_emb = [0.1] * 384
+    import mayring_core.providers as _providers
+    monkeypatch.setattr(_providers, "embed_texts", lambda texts, url: [fake_emb] * len(texts))
+    import mayring_core.memory.ingestion.conversation_filter as _cf
+    monkeypatch.setattr(_cf, "should_skip_chunk", lambda text, stype: (False, ""))
+    import mayring_core.memory.ingestion.mayring_process as _mp
+
+    class _R:
+        category_id = 1
+    monkeypatch.setattr(_mp, "categorize_chunks", lambda *a, **k: [_R()])
+    monkeypatch.setattr(_mp, "derive_labels_from_categories", lambda conn, ids: {})
+    import mayring_core.memory.store as _store
+    monkeypatch.setattr(_store, "get_chroma_collection", lambda name=None: object())
+
+    db_conn = init_memory_db(tmp_path / "memory.db")
+    source = Source(source_id="test:o/r:a.py", source_type="repo_file",
+                    repo="o/r", path="a.py", visibility="private", user_id="u-7")
+    ingest(source=source, content="auth login jwt flow", conn=db_conn,
+           chroma_collection=_FakeCollection(), ollama_url="http://localhost:11434",
+           model="real-text-model", opts={"categorize": True}, workspace_id="ws-x")
+    n = db_conn.execute(
+        "SELECT COUNT(*) FROM llm_calls_log WHERE call_type='categorization' AND workspace_id='ws-x'"
+    ).fetchone()[0]
+    assert n == 1

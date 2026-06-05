@@ -434,6 +434,18 @@ def ingest(
                 batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model, example_cats),
                 project_id=link_project_id)
             category_links = sum(1 for r in results if r.category_id is not None)
+            # call_type='categorization' loggen: das ist jetzt der KANONISCHE Producer
+            # (die EINE Methode) — früher tat das nur das tote mayring_categorize, sodass
+            # der categorization-Observability-Metric (/stats/llm-call-types) keinen
+            # Live-Producer mehr hatte. Hier hat der Ingest conn+model+workspace.
+            try:
+                from mayring_core.memory.store import log_llm_call
+                log_llm_call(conn, "categorization", model or "", goal[:500],
+                             f"{category_links}/{len(chunks_to_categorize)} chunks linked",
+                             tool_calls=category_links, workspace_id=workspace_id)
+            except Exception as exc:  # WHY: Observability darf den Ingest nie failen
+                _log.warning("categorization call_type logging failed (source=%s): %s",
+                             source.source_id, exc)
             _log.info("mayring categorize: %d/%d chunks kategorisiert (source=%s, project=%s, ziel=%r)",
                       category_links, len(chunks_to_categorize), source.source_id,
                       link_project_id, goal[:60])
