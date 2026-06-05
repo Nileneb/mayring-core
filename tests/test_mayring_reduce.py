@@ -43,12 +43,8 @@ def _conn_with_one_active(tmp_path):
     from mayring_core.memory.store import init_memory_db
     conn = init_memory_db(tmp_path / "m.db")
     conn.execute(
-        "INSERT INTO codebooks(slug,description,auto_promote_threshold,created_at,updated_at)"
-        " VALUES ('code','',3,'2026-01-01T00:00:00','2026-01-01T00:00:00')"
-    )
-    conn.execute(
-        "INSERT INTO codebook_categories(id,codebook_id,name,status,embedding_id,"
-        "evidence_count,project_id) VALUES (1,1,'auth','active','cb:1',5,NULL)"
+        "INSERT INTO categories(id,name,status,embedding_id,evidence_count,project_id)"
+        " VALUES (1,'auth','active','cb:1',5,NULL)"
     )
     conn.commit()
     return conn
@@ -88,10 +84,29 @@ def test_mayring_reduce_always_structured_even_if_llm_returns_bare(tmp_path):
     assert res.candidates[0].match == "deductive"
 
 
-def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path):
+def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypatch):
     """Kein cosine-Treffer → induktive Hälfte bildet neu (proposed) im Write-Target."""
     conn = _conn_with_one_active(tmp_path)
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
+
+    # Monkeypatch record_proposal mit der NEUEN Signatur (ohne codebook_id).
+    # Der Controller in MayringCoder/src/api/routes/codebooks.py passt die Definition an.
+    import src.api.routes.codebooks as _codebooks_mod
+
+    def _fake_record_proposal(conn, candidate_label, *, paraphrase="",
+                              parent_hint_id=None, igio_axis=None, pi_job_id="",
+                              chunk_id=None, project_id=None):
+        conn.execute(
+            "INSERT OR IGNORE INTO categories(name, status, source, evidence_count) "
+            "VALUES (?, 'proposed', 'induced', 1)",
+            (candidate_label,),
+        )
+        row = conn.execute("SELECT id FROM categories WHERE name=?",
+                           (candidate_label,)).fetchone()
+        return row[0]
+
+    monkeypatch.setattr(_codebooks_mod, "record_proposal", _fake_record_proposal)
+
     # Kandidat-Embedding orthogonal zur Bestandskategorie → kein Treffer → neu
     res = mayring_reduce(
         "completely unrelated topic", theme="ux", conn=conn,
@@ -103,7 +118,7 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path):
     assert res.candidates[0].label == "ux_flow"
     assert res.candidates[0].match in ("inductive", "dedup")
     row = conn.execute(
-        "SELECT name FROM codebook_categories WHERE name='ux_flow'").fetchone()
+        "SELECT name FROM categories WHERE name='ux_flow'").fetchone()
     assert row is not None
 
 

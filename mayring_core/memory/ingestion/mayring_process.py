@@ -59,24 +59,20 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
 
 
-def _load_categories(conn: Any, codebook_id: int | None, statuses: tuple[str, ...],
+def _load_categories(conn: Any, statuses: tuple[str, ...],
                      project_id: str | None = None) -> list[dict]:
-    """Category scope. codebook_id=None → CROSS-codebook (alle Codebooks) — der
-    Bulk-Pfad matcht so domänen-übergreifend (das Embedding routet den Chunk selbst,
-    kein fragiles source_type→codebook-Mapping); ein konkretes codebook_id scoped auf
-    eines (interaktiv: der gewählte Codebook). project_id: shared base (NULL) ∪ die
-    eigenen induzierten Kategorien des aktiven Projekts."""
+    """Kategorien aus der flachen `categories`-Tabelle (v19, kein codebook_id mehr).
+    project_id: shared base (NULL) ∪ die eigenen induzierten Kategorien des aktiven Projekts."""
     placeholders = ",".join("?" for _ in statuses)
     if project_id:
         scope, extra = "AND (project_id IS NULL OR project_id = ?)", (project_id,)
     else:
         scope, extra = "AND project_id IS NULL", ()
-    cb_clause, cb_extra = ("AND codebook_id=?", (codebook_id,)) if codebook_id is not None else ("", ())
     rows = conn.execute(
         "SELECT id, name, igio_axis, parent_id, embedding_id, status, evidence_count "
-        f"FROM codebook_categories WHERE status IN ({placeholders}) {cb_clause} "
+        f"FROM categories WHERE status IN ({placeholders}) "
         f"{scope} ORDER BY id",
-        (*statuses, *cb_extra, *extra),
+        (*statuses, *extra),
     ).fetchall()
     return [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
              "embedding_id": r[4], "status": r[5], "evidence_count": r[6]} for r in rows]
@@ -143,7 +139,7 @@ def derive_labels_from_categories(
     out: dict[str, list[str]] = {}
     for cid, name in conn.execute(
         "SELECT cc.chunk_id, cat.name FROM chunk_categories cc "
-        "JOIN codebook_categories cat ON cat.id = cc.category_id "
+        "JOIN categories cat ON cat.id = cc.category_id "
         f"WHERE cc.chunk_id IN ({ph}) ORDER BY cc.confidence DESC",
         tuple(chunk_ids),
     ).fetchall():
@@ -229,7 +225,7 @@ def link_chunks_deductive(
     else:
         scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
-        "SELECT id, name, igio_axis, parent_id, embedding_id FROM codebook_categories "
+        "SELECT id, name, igio_axis, parent_id, embedding_id FROM categories "
         f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
     cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
              "embedding_id": r[4]} for r in rows]
@@ -272,7 +268,7 @@ def _active_category_pairs(conn: Any, chroma_categories: Any,
     else:
         scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
-        "SELECT id, name, igio_axis, parent_id, embedding_id FROM codebook_categories "
+        "SELECT id, name, igio_axis, parent_id, embedding_id FROM categories "
         f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
     cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
              "embedding_id": r[4]} for r in rows]
@@ -357,30 +353,16 @@ def reduce_prompt(text: str, task: str,
         "Antworte NUR mit dem finalen Kategorie-Label (snake_case), nichts anderes.")
 
 
-def _the_codebook_id(conn: Any) -> int:
-    """DAS eine, domänenunabhängige Codebook. Es gibt kein source_type→codebook-Routing
-    (kanonische Methode ist domänenunabhängig). Bevorzugt 'universal'; bis die 5→1-Migration
-    durch ist, sonst das einzige verbleibende. Kein Default-Raten — eine feste Quelle."""
-    row = conn.execute("SELECT id FROM codebooks WHERE slug='universal'").fetchone()
-    if row is None:
-        row = conn.execute("SELECT id FROM codebooks ORDER BY id LIMIT 1").fetchone()
-    if row is None:
-        raise ValueError("kein Codebook vorhanden — DB nicht initialisiert")
-    return int(row[0])
-
-
-def _promote_threshold(conn: Any, codebook_id: int) -> int:
-    row = conn.execute(
-        "SELECT auto_promote_threshold FROM codebooks WHERE id=?", (codebook_id,)
-    ).fetchone()
-    return int(row[0]) if row and row[0] is not None else 3
+# WHY(v19-drop-codebook): codebooks-Tabelle weg, auto_promote_threshold war IMMER 3
+# (kein Caller hat jemals ein abweichendes Codebook mit anderem Threshold angelegt).
+_AUTO_PROMOTE_THRESHOLD = 3
 
 
 def _bump_evidence(conn: Any, cat_id: int) -> int:
     """Increment evidence_count and return the NEW value (for promotion check)."""
-    conn.execute("UPDATE codebook_categories SET evidence_count = evidence_count + 1 "
+    conn.execute("UPDATE categories SET evidence_count = evidence_count + 1 "
                  "WHERE id=?", (cat_id,))
-    row = conn.execute("SELECT evidence_count FROM codebook_categories WHERE id=?",
+    row = conn.execute("SELECT evidence_count FROM categories WHERE id=?",
                        (cat_id,)).fetchone()
     return int(row[0]) if row else 0
 
@@ -391,7 +373,7 @@ def _maybe_promote(conn: Any, cat_id: int, status: str, evidence_count: int,
     active-only) die induktiv gebildete Kategorie. Ohne diesen Schritt bleibt induktiver
     Output inert (Defekt vor canonical-Konsolidierung)."""
     if status != "active" and evidence_count >= threshold:
-        conn.execute("UPDATE codebook_categories SET status='active', promoted_at=? WHERE id=?",
+        conn.execute("UPDATE categories SET status='active', promoted_at=? WHERE id=?",
                      (_now_iso(), cat_id))
         conn.execute("UPDATE codebook_proposals SET decision='promote', reviewed_by='auto' "
                      "WHERE category_id=? AND decision IS NULL", (cat_id,))
@@ -400,7 +382,7 @@ def _maybe_promote(conn: Any, cat_id: int, status: str, evidence_count: int,
 
 
 def _assign_or_create(
-    conn: Any, chroma_categories: Any, target_codebook_id: int, chunk_id: str | None,
+    conn: Any, chroma_categories: Any, chunk_id: str | None,
     candidate_label: str, candidate_emb: list[float],
     active_pairs: list[tuple[dict, list[float]]],
     dedup_pairs: list[tuple[dict, list[float]]], *,
@@ -409,11 +391,10 @@ def _assign_or_create(
 ) -> ProcessResult:
     """Die geteilte Entscheidung beider Pfade (Einzel + Bulk) — EINE Logik, kein Duplikat.
     Erwartet die ABGELEITETE Kandidat-Kategorie (Label + Embedding) und die geladenen
-    Kategorie-Mengen: `active_pairs` für den deduktiven Match (vom Caller gescoped:
-    cross-codebook im Bulk, ein Codebook interaktiv), `dedup_pairs` (active+proposed) fürs
-    induktive Dedup. `target_codebook_id` = wohin eine echte Neu-Kategorie geschrieben wird.
-    `dedup_pairs` wird bei einer Neu-Kategorie IN-PLACE erweitert → nachfolgende Chunks
-    desselben Batches dedupen darauf (intra-batch, ohne Reload). Schritte 3-5 des Ablaufs."""
+    Kategorie-Mengen: `active_pairs` für den deduktiven Match, `dedup_pairs` (active+proposed)
+    fürs induktive Dedup. `dedup_pairs` wird bei einer Neu-Kategorie IN-PLACE erweitert →
+    nachfolgende Chunks desselben Batches dedupen darauf (intra-batch, ohne Reload).
+    Schritte 3-5 des Ablaufs. (v19: kein target_codebook_id mehr — eine flache categories-Tabelle.)"""
     # 3+4 deduktiv: abgeleitete Kategorie matcht eine vorhandene >= 0.70 → vorhandene nutzen
     top_cat, score = _best_match(candidate_emb, active_pairs)
     if top_cat is not None and score >= _MATCH_MIN:
@@ -437,19 +418,21 @@ def _assign_or_create(
                              round(dedup_score, 4), dedup_cat.get("igio_axis"),
                              proposed=(dedup_cat.get("status") != "active" and not promoted))
 
-    # echte Neu-Kategorie (ziel-gebunden gebildet) als 'proposed' im Ziel-Codebook; Embedding
-    # hinterlegen, damit sie ab Promotion für cat_match matchbar ist + Folge-Runden dedupen.
+    # echte Neu-Kategorie (ziel-gebunden gebildet) als 'proposed'; Embedding hinterlegen,
+    # damit sie ab Promotion für cat_match matchbar ist + Folge-Runden dedupen.
     from src.api.routes.codebooks import record_proposal  # late: web import cycle
     parent_hint_id = top_cat["id"] if top_cat is not None else None
     igio = _infer_igio_axis(candidate_label)
-    cat_id = record_proposal(conn, target_codebook_id, candidate_label, paraphrase=task[:200],
+    # WHY(v19-drop-codebook): record_proposal-Signatur OHNE codebook_id (Controller passt
+    # die Definition in MayringCoder/src/api/routes/codebooks.py an).
+    cat_id = record_proposal(conn, candidate_label, paraphrase=task[:200],
                              parent_hint_id=parent_hint_id, igio_axis=igio,
                              pi_job_id=pi_job_id, chunk_id=chunk_id, project_id=project_id)
     emb_id = f"cb:proposed:{cat_id}"
     if chroma_categories is not None and candidate_emb:
         chroma_categories.upsert(ids=[emb_id], embeddings=[candidate_emb],
                                  documents=[candidate_label])
-        conn.execute("UPDATE codebook_categories SET embedding_id=? WHERE id=?",
+        conn.execute("UPDATE categories SET embedding_id=? WHERE id=?",
                      (emb_id, cat_id))
     if chunk_id:
         _link_chunk(conn, chunk_id, cat_id, version=codebook_version,
@@ -482,9 +465,8 @@ def mayring_process(
     if not (task or "").strip():
         raise ValueError("mayring_process: 'task' required — Zielbezug ist obligatorisch")
 
-    codebook_id = _the_codebook_id(conn)
-    # active EINMAL laden — Granularitäts-Beispiele für die Reduktion + Match-Menge (cross-codebook).
-    active = _load_categories(conn, None, ("active",), active_project_id)
+    # active EINMAL laden — Granularitäts-Beispiele für die Reduktion + Match-Menge.
+    active = _load_categories(conn, ("active",), active_project_id)
     # Schritt 1+2: aus Text GEBUNDEN AN DAS ZIEL die Kandidat-Kategorie ableiten.
     candidate = _clean_label(llm_fn(reduce_prompt(text, task, [c["name"] for c in active])))
     if not candidate:
@@ -495,12 +477,12 @@ def mayring_process(
 
     active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, None, ("active", "proposed"), active_project_id))
+        chroma_categories, _load_categories(conn, ("active", "proposed"), active_project_id))
     try:
         res = _assign_or_create(
-            conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
+            conn, chroma_categories, chunk_id, candidate, candidate_emb,
             active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
-            project_id=active_project_id, promote_threshold=_promote_threshold(conn, codebook_id),
+            project_id=active_project_id, promote_threshold=_AUTO_PROMOTE_THRESHOLD,
             pi_job_id=pi_job_id)
         conn.commit()
     except Exception:
@@ -534,14 +516,12 @@ def categorize_chunks(
     if len(embs) != len(candidates):
         raise ValueError("categorize_chunks: Embedding-Anzahl != Kandidaten-Anzahl")
 
-    target_codebook_id = _the_codebook_id(conn)
-    threshold = _promote_threshold(conn, target_codebook_id)
     # active (deduktiver Match) + dedup (active+proposed) EINMAL pro Batch laden; neue
     # Kategorien werden von _assign_or_create in-place angehängt → intra-batch sichtbar.
     active_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, None, ("active",), project_id))
+        chroma_categories, _load_categories(conn, ("active",), project_id))
     dedup_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, None, ("active", "proposed"), project_id))
+        chroma_categories, _load_categories(conn, ("active", "proposed"), project_id))
     out: list[ProcessResult] = []
     # Per-Chunk committen: hält den SQLite-Write-Lock NICHT über den ganzen Batch + alle
     # Chroma-Upserts; rollback bei Fehler, damit NIE eine offene Transaktion leakt (sonst
@@ -551,9 +531,9 @@ def categorize_chunks(
             if not candidate or not emb:
                 continue
             out.append(_assign_or_create(
-                conn, chroma_categories, target_codebook_id, chunk_id, candidate, list(emb),
+                conn, chroma_categories, chunk_id, candidate, list(emb),
                 active_pairs, dedup_pairs, task=task, codebook_version=codebook_version,
-                project_id=project_id, promote_threshold=threshold))
+                project_id=project_id, promote_threshold=_AUTO_PROMOTE_THRESHOLD))
             conn.commit()
     except Exception:
         conn.rollback()
@@ -629,7 +609,7 @@ def mayring_reduce(
     if not (theme or "").strip():
         raise ValueError("mayring_reduce: 'theme' required — Zielbezug obligatorisch")
 
-    active = _load_categories(conn, None, ("active",), project_id)
+    active = _load_categories(conn, ("active",), project_id)
     paraphrase, generalization, candidate = _parse_structured(
         llm_fn(_structured_reduce_prompt(text, theme, [c["name"] for c in active])))
     if not candidate:
@@ -638,15 +618,14 @@ def mayring_reduce(
     if not candidate_emb:
         raise ValueError("mayring_reduce: embedding fehlgeschlagen (fail-closed)")
 
-    codebook_id = _the_codebook_id(conn)
     active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
-        chroma_categories, _load_categories(conn, None, ("active", "proposed"), project_id))
+        chroma_categories, _load_categories(conn, ("active", "proposed"), project_id))
     try:
         res = _assign_or_create(
-            conn, chroma_categories, codebook_id, chunk_id, candidate, candidate_emb,
+            conn, chroma_categories, chunk_id, candidate, candidate_emb,
             active_pairs, dedup_pairs, task=theme, codebook_version=codebook_version,
-            project_id=project_id, promote_threshold=_promote_threshold(conn, codebook_id))
+            project_id=project_id, promote_threshold=_AUTO_PROMOTE_THRESHOLD)
         conn.commit()
     except Exception:
         conn.rollback()

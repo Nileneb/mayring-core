@@ -136,7 +136,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -286,6 +286,11 @@ def _migrate_schema(conn: DBAdapter) -> None:
         # v2 Phase 3.2 (project-scoped codebook): NULL = geteilte Profil-Basis
         # (imported), gesetzt = projekt-spezifisch induziert. Der aktive
         # Kategorien-Satz einer Session = Basis ∪ active_project.categories.
+        # NOTE: "categories" is the post-v19 name; "codebook_categories" is kept
+        # here so the generic column-migration can still back-fill project_id on
+        # DBs that are at v18 and haven't been collapsed yet. The migration guard
+        # in _migrate_codebook_collapse short-circuits when "categories" already
+        # exists, so this entry is a no-op on fully-migrated DBs.
         "codebook_categories": [
             ("project_id", "TEXT DEFAULT NULL"),
         ],
@@ -598,6 +603,79 @@ def migrate_visibility_axis(conn: DBAdapter, personal_owner: dict | None = None)
     conn.commit()
 
 
+def _migrate_codebook_collapse(conn: DBAdapter) -> None:
+    """v19: Codebook-Konzept entfernen. codebook_categories → categories (ohne codebook_id,
+    UNIQUE(name)), dependent FKs (chunk_categories, codebook_proposals) auf categories
+    umgebogen, codebooks-Tabelle gedroppt. Idempotent + geguardet (v14-Lehre: darf init
+    NIE bricken, sonst jeder get_conn 500tet).
+
+    Zwei-Phasen-Rebuild (analog _migrate_visibility_check / _migrate_devices_composite_pk):
+    Phase A: codebook_categories in-place rebuilden (codebook_id weg, UNIQUE(name)) unter
+    GLEICHEM Namen → dependent FKs (chunk_categories.category_id, codebook_proposals.
+    category_id/parent_hint_id, self parent_id) binden danach wieder an codebook_categories.
+    Phase B: RENAME zu "categories" mit legacy_alter_table=OFF → SQLite rewritet alle
+    FK-Refs auf "categories".
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "categories" in tables or "codebook_categories" not in tables:
+        return  # frische DB oder schon migriert
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        # Phase A: codebook_categories in-place rebuilden (codebook_id weg,
+        # UNIQUE(name)). Gleicher Name → dependent FKs binden danach wieder.
+        conn.execute("DROP TABLE IF EXISTS codebook_categories_old_v19")
+        conn.execute("ALTER TABLE codebook_categories RENAME TO codebook_categories_old_v19")
+        conn.execute(
+            """
+            CREATE TABLE codebook_categories (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
+                parent_id       INTEGER REFERENCES codebook_categories(id),
+                description     TEXT NOT NULL DEFAULT '',
+                examples        TEXT NOT NULL DEFAULT '[]',
+                status          TEXT NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active','proposed','deprecated')),
+                source          TEXT NOT NULL DEFAULT 'imported'
+                                CHECK (source IN ('manual','induced','imported')),
+                evidence_count  INTEGER NOT NULL DEFAULT 0,
+                embedding_id    TEXT NOT NULL DEFAULT '',
+                risk_level      TEXT NOT NULL DEFAULT '',
+                languages       TEXT NOT NULL DEFAULT '[]',
+                patterns        TEXT NOT NULL DEFAULT '[]',
+                promoted_at     TEXT,
+                project_id      TEXT DEFAULT NULL,
+                UNIQUE (name)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO codebook_categories "
+            "(id,name,igio_axis,parent_id,description,examples,status,source,"
+            "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,project_id) "
+            "SELECT id,name,igio_axis,parent_id,description,examples,status,source,"
+            "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,project_id "
+            "FROM codebook_categories_old_v19"
+        )
+        conn.execute("DROP TABLE codebook_categories_old_v19")
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        # Phase B: RENAME zu "categories" — legacy OFF rewritet dependent FK-Refs
+        # (chunk_categories.category_id, codebook_proposals.category_id/parent_hint_id,
+        # self parent_id) auf den neuen Namen "categories".
+        conn.execute("ALTER TABLE codebook_categories RENAME TO categories")
+        conn.execute("DROP TABLE IF EXISTS codebooks")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def _migrate_devices_composite_pk(conn: DBAdapter) -> None:
     """Rebuild `devices` with PK (device_id, workspace_id) — migration v5→v6.
 
@@ -648,6 +726,12 @@ def _init_schema(conn: DBAdapter) -> None:
     """
     # Read current schema version from PRAGMA user_version (default 0 for new DBs)
     current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    # WHY(v14-Lehre): _migrate_codebook_collapse MUSS VOR dem Early-Return laufen
+    # (analog _migrate_rename_research_questions). Auf v18-DBs ist user_version < 19,
+    # also liegt kein Early-Return vor — aber die Prüfung hier macht es explizit
+    # und sichert den Upgrade-Pfad für alle Zwischen-Versionen.
+    _migrate_codebook_collapse(conn)
 
     # If schema is already at current version, skip all DDL and migrations (no-op)
     if current_version >= CURRENT_SCHEMA_VERSION:
@@ -771,25 +855,16 @@ def _init_schema(conn: DBAdapter) -> None:
         CREATE INDEX IF NOT EXISTS idx_chunk_project_links_chunk
             ON chunk_project_links(chunk_id);
 
-        -- #workspace-uuid-sot v2.0 Phase 1: Codebook aus YAML → DB (DB = SoT).
-        -- Category-Embeddings leben in der Chroma-Collection "codebook_categories"
-        -- (embedding_id = Chroma-Doc-ID), NICHT pgvector. Single-Workspace → kein
-        -- workspace_id auf den Codebook-Tabellen.
-        CREATE TABLE IF NOT EXISTS codebooks (
-            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug                    TEXT UNIQUE NOT NULL,
-            description             TEXT NOT NULL DEFAULT '',
-            version                 INTEGER NOT NULL DEFAULT 1,
-            auto_promote_threshold  INTEGER NOT NULL DEFAULT 3,
-            created_at              TEXT NOT NULL,
-            updated_at              TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS codebook_categories (
+        -- v19 (drop-codebook): categories (flach, kein codebook_id, UNIQUE(name)).
+        -- codebooks-Tabelle entfernt. Bestehende DBs werden per _migrate_codebook_collapse
+        -- migriert (codebook_categories → categories); frische DBs erhalten direkt die neue DDL.
+        -- Category-Embeddings leben in der Chroma-Collection "codebook_categories" (Name
+        -- bleibt für Back-Compat, da Chroma-Collections nicht atomar umbenannt werden können).
+        CREATE TABLE IF NOT EXISTS categories (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            codebook_id     INTEGER NOT NULL REFERENCES codebooks(id) ON DELETE CASCADE,
             name            TEXT NOT NULL,
             igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
-            parent_id       INTEGER REFERENCES codebook_categories(id),
+            parent_id       INTEGER REFERENCES categories(id),
             description     TEXT NOT NULL DEFAULT '',
             examples        TEXT NOT NULL DEFAULT '[]',
             status          TEXT NOT NULL DEFAULT 'active'
@@ -803,24 +878,24 @@ def _init_schema(conn: DBAdapter) -> None:
             patterns        TEXT NOT NULL DEFAULT '[]',
             promoted_at     TEXT,
             project_id      TEXT DEFAULT NULL,
-            UNIQUE (codebook_id, name)
+            UNIQUE (name)
         );
-        CREATE INDEX IF NOT EXISTS idx_codebook_cat_codebook
-            ON codebook_categories(codebook_id, status);
+        CREATE INDEX IF NOT EXISTS idx_categories_status
+            ON categories(status);
         CREATE TABLE IF NOT EXISTS codebook_proposals (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id     INTEGER NOT NULL REFERENCES codebook_categories(id) ON DELETE CASCADE,
+            category_id     INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
             pi_job_id       TEXT NOT NULL DEFAULT '',
             chunk_id        TEXT,
             paraphrase      TEXT NOT NULL DEFAULT '',
-            parent_hint_id  INTEGER REFERENCES codebook_categories(id),
+            parent_hint_id  INTEGER REFERENCES categories(id),
             proposed_at     TEXT NOT NULL,
             reviewed_by     TEXT,
             decision        TEXT CHECK (decision IN ('promote','merge','reject') OR decision IS NULL)
         );
         CREATE TABLE IF NOT EXISTS chunk_categories (
             chunk_id          TEXT NOT NULL,
-            category_id       INTEGER NOT NULL REFERENCES codebook_categories(id),
+            category_id       INTEGER NOT NULL REFERENCES categories(id),
             codebook_version  INTEGER NOT NULL DEFAULT 1,
             confidence        REAL NOT NULL DEFAULT 0.0,
             source            TEXT NOT NULL DEFAULT 'deductive'
