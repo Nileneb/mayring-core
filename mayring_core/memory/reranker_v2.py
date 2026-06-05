@@ -110,21 +110,18 @@ def _load_model(version: str = "v2") -> dict[str, Any] | None:
         # bug muss am train_reranker.py-loop behoben werden, nicht hier.
         weights = data.get("weights") or {}
         v_w = float(weights.get("v") or 0.0)
-        s_w = float(weights.get("s") or 0.0)
-        # Issue #187 follow-up: pt/re sind retrieval-positive analog zu v/s.
-        # Negativ-flip wäre ein Modell-Bug (z.B. wenn chunks mit rationale-
-        # edge zufällig in den Trainings-data häufiger label=0 hatten).
-        # Bei pt/re=0.0 (kein Training-Signal) → tolerieren; nur bei
-        # NEGATIV → reject mit dem v/s-Gate.
         pt_w = float(weights.get("pt") or 0.0)
-        # re (rationale_edge) ist seit 2026-06-05 KEIN Feature mehr (am Inferenz-Pfad
-        # nicht lieferbar) → nicht mehr gaten. Sein Negativ-Gewicht (-0.67) hatte zuvor
-        # JEDES v2-Modell rejectet → v2 ging nie live. Frische Modelle haben kein re.
-        if v_w < 0 or s_w < 0 or pt_w < 0:
+        # 2026-06-05: s (symbolic) + re (rationale_edge) sind KEINE v2-Features mehr.
+        # s war kollinear zu v (corr +0.51) → Ridge schob das geteilte Query-Match-
+        # Signal in +v und −s → der strikte s<0-Gate rejectete JEDES Modell, obwohl
+        # v stark positiv war (kein echter Leak). s gedroppt (v trägt den Query-Match).
+        # re war am Inferenz-Pfad nicht lieferbar. Hard-Gate jetzt nur noch auf v
+        # (echter #180-Leak-Schutz: Vektor-Sim darf nie anti-korrelieren) + pt>=0.
+        if v_w < 0 or pt_w < 0:
             _log.error(
-                "rerank_%s.json degenerate (v=%.3f s=%.3f pt=%.3f); "
+                "rerank_%s.json degenerate (v=%.3f pt=%.3f); "
                 "refusing to load. Retrieval-positive Features dürfen "
-                "nicht negativ rankt werden.", version, v_w, s_w, pt_w,
+                "nicht negativ rankt werden.", version, v_w, pt_w,
             )
             _MODEL_CACHE[version] = (None, st.st_mtime)
             return None
