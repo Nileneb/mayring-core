@@ -747,6 +747,12 @@ def _rerank(
             for a_label in ("issue", "goal", "intervention", "outcome", "unknown"):
                 stage[f"igio_{a_label}"] = 1.0 if axis == a_label else 0.0
             stage["cat_match"] = scat_id   # reranker-v3 (#270)
+            # pt (predicted_topic) IST ein gelerntes Feature (train_reranker.FEATURES,
+            # loader-gated >=0). Es war geloggt+trainiert, aber nie in den stage-Dict am
+            # Inferenz-Pfad gelegt → das gelernte pt-Gewicht lief immer auf pt=0 (totes
+            # Training). Jetzt geliefert, damit das Gewicht greift. (re bleibt draußen:
+            # rationale_edges sind erst nach dem Scoring bekannt — pro-Kandidat zu teuer.)
+            stage["pt"] = sp
             score_final = score_v2(stage, rr_model)
             # WHY(2026-05-28): the deterministic _CAT_MATCH_BOOST lives in
             # score_v1 above, but v2 replaces score_v1 wholesale — so re-apply
@@ -761,12 +767,6 @@ def _rerank(
             # C3 v18: v2 replaces score_v1 wholesale, so re-apply the deterministic
             # project_match boost here too (same rationale as cat_match above).
             score_final = min(1.0, score_final + _PROJECT_MATCH_BOOST * sproj)
-            # predicted_topic: score_v1 hat _PRED_BOOST * sp, v2 ersetzt score_v1
-            # wholesale → ohne dieses Re-Apply ginge das Markov-Folgethema-Signal in
-            # v2 komplett verloren (war geloggt+trainiert, aber am Inferenz-Pfad nie
-            # angelegt — dieselbe Lücke wie cat_match/project; deterministisch, nicht
-            # über das gelernte Gewicht, das auf was_referenced-Labels unzuverlässig ist).
-            score_final = min(1.0, score_final + _PRED_BOOST * sp)
         else:
             score_final = score_v1
 
