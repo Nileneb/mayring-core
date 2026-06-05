@@ -565,16 +565,29 @@ _DECISION_TO_MATCH = {
 
 def _parse_structured(raw: str) -> tuple[str, str, str]:
     """JSON {paraphrase,generalization,label} → (paraphrase, generalization, clean label).
-    Fail-soft: kein JSON → ('', '', _clean_label(raw))."""
-    try:
-        obj = _json_mod.loads(raw)
-        if isinstance(obj, dict):
+    Robust gegen reale LLM-Outputs: <think>…</think> (thinking-Modelle), Markdown-Fences
+    (```json …```) und Prosa um das Objekt. WHY(2026-06-05): ohne Fence-Stripping schlug
+    json.loads fehl → _clean_label griff "json" aus der ```json-Zeile → jede Kategorie
+    wurde "json" (pi_categorize in Prod kaputt). Fail-soft erst wenn KEIN {…} parsebar."""
+    import re as _re
+    s = _re.sub(r"<think>.*?</think>", "", raw or "", flags=_re.S).strip()
+    candidates = [s]
+    fenced = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, flags=_re.S)
+    if fenced:
+        candidates.insert(0, fenced.group(1))
+    obj_match = _re.search(r"\{.*\}", s, flags=_re.S)   # erstes/größtes JSON-Objekt
+    if obj_match:
+        candidates.append(obj_match.group(0))
+    for cand in candidates:
+        try:
+            obj = _json_mod.loads(cand)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict) and str(obj.get("label", "")).strip():
             return (str(obj.get("paraphrase", "")).strip(),
                     str(obj.get("generalization", "")).strip(),
                     _clean_label(str(obj.get("label", ""))))
-    except (ValueError, TypeError):
-        pass
-    return "", "", _clean_label(raw)
+    return "", "", _clean_label(s)
 
 
 def _structured_reduce_prompt(text: str, theme: str,

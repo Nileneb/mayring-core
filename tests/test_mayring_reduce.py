@@ -134,3 +134,19 @@ def test_mayring_reduce_fail_closed_on_empty(tmp_path):
         mayring_reduce("text", theme="", conn=conn,
                        chroma_categories=chroma, embed_fn=lambda s: [1.0],
                        llm_fn=lambda p: "x")
+
+
+def test_parse_structured_handles_markdown_fence_and_thinking():
+    """Regression 2026-06-05: LLMs wrappen JSON in ```json-Fences / <think>-Tokens →
+    json.loads schlug fehl → Label wurde "json". Muss das echte Label extrahieren."""
+    from mayring_core.memory.ingestion.mayring_process import _parse_structured
+    fenced = '```json\n{"paraphrase":"p","generalization":"g","label":"auth"}\n```'
+    assert _parse_structured(fenced) == ("p", "g", "auth")
+    thinking = '<think>hmm let me reduce</think>\n{"paraphrase":"x","generalization":"y","label":"data_access"}'
+    assert _parse_structured(thinking)[2] == "data_access"
+    prose = 'Here is the result: {"paraphrase":"a","generalization":"b","label":"config"} done.'
+    assert _parse_structured(prose)[2] == "config"
+    # bare JSON weiterhin ok
+    assert _parse_structured('{"label":"api"}')[2] == "api"
+    # echtes Nicht-JSON → fail-soft auf clean label, NICHT "json"
+    assert _parse_structured("auth_flow") == ("", "", "auth_flow")
