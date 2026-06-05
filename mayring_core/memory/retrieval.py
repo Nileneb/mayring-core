@@ -761,6 +761,12 @@ def _rerank(
             # C3 v18: v2 replaces score_v1 wholesale, so re-apply the deterministic
             # project_match boost here too (same rationale as cat_match above).
             score_final = min(1.0, score_final + _PROJECT_MATCH_BOOST * sproj)
+            # predicted_topic: score_v1 hat _PRED_BOOST * sp, v2 ersetzt score_v1
+            # wholesale → ohne dieses Re-Apply ginge das Markov-Folgethema-Signal in
+            # v2 komplett verloren (war geloggt+trainiert, aber am Inferenz-Pfad nie
+            # angelegt — dieselbe Lücke wie cat_match/project; deterministisch, nicht
+            # über das gelernte Gewicht, das auf was_referenced-Labels unzuverlässig ist).
+            score_final = min(1.0, score_final + _PRED_BOOST * sp)
         else:
             score_final = score_v1
 
