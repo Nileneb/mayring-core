@@ -45,7 +45,7 @@ def test_fresh_db_has_chunk_project_links():
         cols = set(_cols(conn, "chunk_project_links"))
         assert {"chunk_id", "project_id", "origin_ref",
                 "source", "workspace_id", "created_at"} <= cols
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 20
 
 
 def test_existing_v17_db_upgrades_without_raise():
@@ -63,7 +63,7 @@ def test_existing_v17_db_upgrades_without_raise():
         tables = {r[0] for r in conn2.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "chunk_project_links" in tables
-        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert conn2.execute("PRAGMA user_version").fetchone()[0] == 20
 
 
 def test_link_and_bulk_lookup_idempotent_and_ws_isolated():
