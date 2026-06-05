@@ -140,3 +140,32 @@ def test_categorize_logs_call_type_categorization(monkeypatch, tmp_path):
         "SELECT COUNT(*) FROM llm_calls_log WHERE call_type='categorization' AND workspace_id='ws-x'"
     ).fetchone()[0]
     assert n == 1
+
+
+def test_ingest_persists_source_goal(monkeypatch, tmp_path):
+    """v20: der goal-anchor (Mayring Selektionskriterium) wird pro Source in
+    source_goals persistiert → spätere treue Re-Kategorisierung + Fallback-Audit."""
+    fake_emb = [0.1] * 384
+    import mayring_core.providers as _providers
+    monkeypatch.setattr(_providers, "embed_texts", lambda texts, url: [fake_emb] * len(texts))
+    import mayring_core.memory.ingestion.conversation_filter as _cf
+    monkeypatch.setattr(_cf, "should_skip_chunk", lambda text, stype: (False, ""))
+    import mayring_core.memory.ingestion.mayring_process as _mp
+
+    class _R:
+        category_id = 1
+    monkeypatch.setattr(_mp, "categorize_chunks", lambda *a, **k: [_R()])
+    monkeypatch.setattr(_mp, "derive_labels_from_categories", lambda conn, ids: {})
+    import mayring_core.memory.store as _store
+    monkeypatch.setattr(_store, "get_chroma_collection", lambda name=None: object())
+
+    db_conn = init_memory_db(tmp_path / "memory.db")
+    source = Source(source_id="test:o/r:auth.py", source_type="repo_file",
+                    repo="o/r", path="auth.py", visibility="private", user_id="u-7")
+    ingest(source=source, content="auth login jwt flow", conn=db_conn,
+           chroma_collection=_FakeCollection(), ollama_url="http://localhost:11434",
+           model="real-text-model", opts={"categorize": True, "task": "security audit"},
+           workspace_id="ws-x")
+    row = db_conn.execute(
+        "SELECT goal FROM source_goals WHERE source_id=?", (source.source_id,)).fetchone()
+    assert row is not None and row[0] == "security audit"

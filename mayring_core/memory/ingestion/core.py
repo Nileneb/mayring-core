@@ -434,6 +434,21 @@ def ingest(
                 batch_reduce_fn=lambda pairs: _batch_reduce_labels(pairs, ollama_url, model, example_cats),
                 project_id=link_project_id)
             category_links = sum(1 for r in results if r.category_id is not None)
+            # Goal-Anchor persistieren (2026-06-05): gegen DIESES goal wurden die Chunks
+            # kategorisiert. Macht spätere treue Re-Kategorisierung möglich + auditierbar,
+            # welche Sources auf einen schwachen Fallback-Anker ("Inhalte aus …") liefen.
+            try:
+                from datetime import datetime, timezone
+                conn.execute(
+                    "INSERT INTO source_goals(source_id, goal, updated_at) VALUES (?,?,?) "
+                    "ON CONFLICT(source_id) DO UPDATE SET goal=excluded.goal, "
+                    "updated_at=excluded.updated_at",
+                    (source.source_id, goal[:1000],
+                     datetime.now(timezone.utc).isoformat()))
+                conn.commit()
+            except Exception as exc:  # WHY: Anker-Persistenz darf den Ingest nie failen
+                _log.warning("source_goals persist failed (source=%s): %s",
+                             source.source_id, exc)
             # call_type='categorization' loggen: das ist jetzt der KANONISCHE Producer
             # (die EINE Methode) — früher tat das nur das tote mayring_categorize, sodass
             # der categorization-Observability-Metric (/stats/llm-call-types) keinen

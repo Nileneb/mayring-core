@@ -136,7 +136,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 19
+CURRENT_SCHEMA_VERSION = 20  # v20: sources.categorize_goal (Goal-Anchor persistieren)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -1014,6 +1014,19 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_llm_calls_created
             ON llm_calls_log(created_at);
+
+        -- source_goals (v20): der goal-anchor (Mayring Selektionskriterium), gegen
+        -- den die Chunks einer Source kategorisiert wurden. Die kanonische Methode
+        -- ist goal-anchored, aber das goal war bisher transient (nur lose in
+        -- llm_calls_log) → treues Re-Labeling unmöglich, Fallback-anchored Chunks
+        -- nicht auditierbar. Eigene Tabelle statt sources-Spalte: die sources-Tabelle
+        -- wird vom v15-visibility-Rebuild umgebaut (fragil) — entkoppeln. Ein
+        -- "Inhalte aus …"-goal markiert die schwachen Fallback-Anker.
+        CREATE TABLE IF NOT EXISTS source_goals (
+            source_id   TEXT PRIMARY KEY,
+            goal        TEXT NOT NULL DEFAULT '',
+            updated_at  TEXT NOT NULL DEFAULT ''
+        );
 
         -- Workspace-Identity-Foundation. Bisher war workspace_id ein
         -- freier String den jeder Code-Pfad anders auflöste:
