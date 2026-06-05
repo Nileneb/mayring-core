@@ -191,6 +191,44 @@ def write_runtime_default(version: str) -> str:
     return version
 
 
+def _autorollout_path() -> Path:
+    return _cache_dir() / "rerank_autorollout.txt"
+
+
+def read_autorollout_enabled() -> bool:
+    """Darf der Auto-Rollout-Cron den Default automatisch flippen? Default True
+    (Status quo). 'off' = das A/B-Gate ist abgestellt → die manuelle Wahl
+    (write_runtime_default / activate) bleibt stehen, der Cron-Flip ist deaktiviert."""
+    try:
+        return _autorollout_path().read_text(encoding="utf-8").strip().lower() != "off"
+    except (OSError, FileNotFoundError):
+        return True
+
+
+def write_autorollout_enabled(enabled: bool) -> bool:
+    p = _autorollout_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("on" if enabled else "off", encoding="utf-8")
+    return enabled
+
+
+def delete_reranker_version(version: str) -> bool:
+    """Lösche ein trainiertes Modell-File (rerank_v<N>.json). Guard: nie v1/auto
+    (Baseline ohne File) und nie das AKTIVE Modell (sonst zeigt der Runtime-Default
+    ins Leere). Returns True wenn gelöscht, False wenn File nicht existierte."""
+    version = (version or "").strip().lower()
+    if version in ("v1", "auto") or not _VERSION_RE.match(version):
+        raise ValueError(f"nicht löschbar: {version!r} (nur trainierte v<N>-Modelle)")
+    if _read_runtime_default() == version:
+        raise ValueError(f"{version!r} ist aktiv — erst eine andere Version aktivieren")
+    p = _model_path(version)
+    if not p.exists():
+        return False
+    p.unlink()
+    invalidate_v2_cache()
+    return True
+
+
 def list_reranker_versions() -> list[dict[str, Any]]:
     """All selectable reranker versions for the dashboard table.
 
