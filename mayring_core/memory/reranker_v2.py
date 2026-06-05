@@ -117,12 +117,14 @@ def _load_model(version: str = "v2") -> dict[str, Any] | None:
         # Bei pt/re=0.0 (kein Training-Signal) → tolerieren; nur bei
         # NEGATIV → reject mit dem v/s-Gate.
         pt_w = float(weights.get("pt") or 0.0)
-        re_w = float(weights.get("re") or 0.0)
-        if v_w < 0 or s_w < 0 or pt_w < 0 or re_w < 0:
+        # re (rationale_edge) ist seit 2026-06-05 KEIN Feature mehr (am Inferenz-Pfad
+        # nicht lieferbar) → nicht mehr gaten. Sein Negativ-Gewicht (-0.67) hatte zuvor
+        # JEDES v2-Modell rejectet → v2 ging nie live. Frische Modelle haben kein re.
+        if v_w < 0 or s_w < 0 or pt_w < 0:
             _log.error(
-                "rerank_%s.json degenerate (v=%.3f s=%.3f pt=%.3f re=%.3f); "
+                "rerank_%s.json degenerate (v=%.3f s=%.3f pt=%.3f); "
                 "refusing to load. Retrieval-positive Features dürfen "
-                "nicht negativ rankt werden.", version, v_w, s_w, pt_w, re_w,
+                "nicht negativ rankt werden.", version, v_w, s_w, pt_w,
             )
             _MODEL_CACHE[version] = (None, st.st_mtime)
             return None
