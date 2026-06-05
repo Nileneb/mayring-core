@@ -82,6 +82,7 @@ def _default_generate(
     options: dict | None = None,
     response_format: str | None = None,
     num_predict: int = 4096,
+    think: bool | None = None,
 ) -> str:
     from mayring_core.config import OLLAMA_TIMEOUT
     from mayring_core.ollama_client import generate
@@ -96,6 +97,7 @@ def _default_generate(
         options=options,
         response_format=response_format,
         num_predict=num_predict,
+        think=think,
     )
 
 
