@@ -604,7 +604,7 @@ def mayring_reduce(
     text: str, theme: str, *,
     conn: Any, chroma_categories: Any, embed_fn: EmbedFn, llm_fn: LlmFn,
     chunk_id: str | None = None, codebook_version: int = 1,
-    project_id: str | None = None,
+    project_id: str | None = None, dry_run: bool = False,
 ) -> ReduceResult:
     """Die EINE Mayring-Methode (mixed, immer, domänenunabhängig): Ziel → Paraphrase →
     Generalisierung → Reduktion → cosine gegen ALLE aktiven Kategorien. Treffer >=0.70:
@@ -634,6 +634,22 @@ def mayring_reduce(
     active_pairs = _category_embeddings(chroma_categories, active)
     dedup_pairs = _category_embeddings(
         chroma_categories, _load_categories(conn, ("active", "proposed"), project_id))
+
+    # WHY(2026-06-05, modell-duell): dry_run bestimmt NUR welche Mayring-Hälfte griffe
+    # (deduktiv-Treffer / dedup / induktiv-neu) und schreibt NICHTS — sonst legt jeder
+    # Duell-Lauf induktive Test-Kategorien an und verschmutzt das eine Codebook.
+    if dry_run:
+        top_cat, score = _best_match(candidate_emb, active_pairs)
+        if top_cat is not None and score >= _MATCH_MIN:
+            return ReduceResult(paraphrase, generalization, [Candidate(
+                top_cat["name"], "deductive", round(score, 4), top_cat["id"])])
+        dedup_cat, dedup_score = _best_match(candidate_emb, dedup_pairs)
+        if dedup_cat is not None and dedup_score > _DEDUP_MIN:
+            return ReduceResult(paraphrase, generalization, [Candidate(
+                dedup_cat["name"], "dedup", round(dedup_score, 4), dedup_cat["id"])])
+        return ReduceResult(paraphrase, generalization, [Candidate(
+            candidate, "inductive", round(score, 4) if top_cat is not None else 0.0, None)])
+
     try:
         res = _assign_or_create(
             conn, chroma_categories, chunk_id, candidate, candidate_emb,

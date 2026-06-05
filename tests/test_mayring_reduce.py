@@ -122,6 +122,41 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypat
     assert row is not None
 
 
+def test_mayring_reduce_dry_run_never_writes(tmp_path):
+    """dry_run: liefert das induktive Label OHNE eine Kategorie anzulegen (Modell-Duelle
+    dürfen das eine Codebook nicht verschmutzen)."""
+    conn = _conn_with_one_active(tmp_path)
+    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
+    before = conn.execute("SELECT count(*) FROM categories").fetchone()[0]
+    res = mayring_reduce(
+        "completely unrelated topic", theme="ux", conn=conn,
+        chroma_categories=chroma, embed_fn=lambda s: [0.0, 1.0, 0.0],
+        llm_fn=lambda p: json.dumps(
+            {"paraphrase": "p", "generalization": "g", "label": "ux_flow"}),
+        dry_run=True,
+    )
+    assert res.candidates[0].label == "ux_flow"
+    assert res.candidates[0].match == "inductive"
+    after = conn.execute("SELECT count(*) FROM categories").fetchone()[0]
+    assert after == before          # KEIN Write
+    assert conn.execute("SELECT id FROM categories WHERE name='ux_flow'").fetchone() is None
+
+
+def test_mayring_reduce_dry_run_deductive_hit_read_only(tmp_path):
+    """dry_run mit cosine-Treffer: meldet die bestehende Kategorie (deductive), schreibt nichts."""
+    conn = _conn_with_one_active(tmp_path)
+    chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
+    res = mayring_reduce(
+        "JWT login flow", theme="security", conn=conn, chroma_categories=chroma,
+        embed_fn=lambda s: [1.0, 0.0, 0.0],
+        llm_fn=lambda p: json.dumps(
+            {"paraphrase": "x", "generalization": "y", "label": "auth_login"}),
+        dry_run=True,
+    )
+    assert res.candidates[0].match == "deductive"
+    assert res.candidates[0].label == "auth"
+
+
 def test_mayring_reduce_fail_closed_on_empty(tmp_path):
     conn = _conn_with_one_active(tmp_path)
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
