@@ -125,16 +125,38 @@ class ModelRouter:
         with target.open("w", encoding="utf-8") as f:
             _yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
+    @staticmethod
+    def _read_text_override() -> str:
+        """Read CACHE_DIR/text_model.txt for a runtime model override.
+
+        # WHY(2026-06-06): text_model.txt ermöglicht Laufzeit-Wechsel des
+        # Text-Modells ohne YAML-Edit oder Neustart. Cache-Dir wird per-Call
+        # frisch aufgelöst (nicht Modul-Level-Konstante) damit MAYRING_CACHE_DIR-
+        # env in Tests und Prod gleich wirkt — identisch zu reranker_v2._cache_dir()
+        # die ebenfalls _resolve_cache_dir() zur Laufzeit aufruft.
+        """
+        try:
+            from mayring_core.config import _resolve_cache_dir, BASE_DIR
+            cache_dir = _resolve_cache_dir(BASE_DIR)
+            override = (cache_dir / "text_model.txt").read_text(encoding="utf-8").strip()
+            return override
+        except (FileNotFoundError, OSError):
+            return ""
+
     def resolve(self, task: str, job_class: str | None = None) -> str:
         """Return model name for task, optional job_class override.
 
-        Priority: config/model_routes.yaml::classes[job_class] → outer route
-        → hardcoded default → "". Unknown job_class silently falls back to
-        outer (no error — opaque per spec #183).
+        Priority: text_model.txt → config/model_routes.yaml::classes[job_class]
+        → outer route → hardcoded default → "". Unknown job_class silently
+        falls back to outer (no error — opaque per spec #183).
 
         Never reads OLLAMA_MODEL env — change models via Web-UI or
         model_routes.yaml.
         """
+        if task == "text":
+            override = self._read_text_override()
+            if override:
+                return override
         cfg = self._routes.get(task)
         if cfg is None:
             return ""
