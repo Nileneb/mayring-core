@@ -71,7 +71,12 @@ RAG_TOP_K = 5                          # Number of similar context entries to in
 EMBEDDING_MODEL = "nomic-embed-text"   # Ollama embedding model (offline)
 
 # Ollama
-OLLAMA_TIMEOUT = 240
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))
+# WHY(#343 api-wedge 2026-06-06): Embeds sind schnell (nomic ~1s). 240s ließ ein
+# hängendes/überlastetes Ollama den (synchron im async-Loop laufenden) Embed-Call
+# bis zu 240s blockieren → Event-Loop + Threadpool wedged → /health + alle Endpoints
+# tot. Embeds failen jetzt fail-fast statt minutenlang zu blockieren.
+OLLAMA_EMBED_TIMEOUT = int(os.getenv("OLLAMA_EMBED_TIMEOUT", "30"))
 OLLAMA_SSL_VERIFY: bool = os.getenv("OLLAMA_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
 
 # Overview-Job Wallclock-Budget in Sekunden (600 war zu klein für große Repos)

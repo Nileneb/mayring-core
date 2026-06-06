@@ -59,14 +59,14 @@ def reset_providers() -> None:
 # --- standalone-safe defaults on core ollama_client -------------------------
 
 def _default_embed(texts: list[str], ollama_url: str) -> list[list[float]]:
-    from mayring_core.config import EMBEDDING_MODEL, OLLAMA_TIMEOUT
+    from mayring_core.config import EMBEDDING_MODEL, OLLAMA_EMBED_TIMEOUT
     from mayring_core.ollama_client import embed_batch, embed_single
 
-    out = embed_batch(ollama_url, EMBEDDING_MODEL, texts, timeout=OLLAMA_TIMEOUT)
+    out = embed_batch(ollama_url, EMBEDDING_MODEL, texts, timeout=OLLAMA_EMBED_TIMEOUT)
     if out is not None:
         return out
     return [
-        embed_single(ollama_url, EMBEDDING_MODEL, t, timeout=OLLAMA_TIMEOUT)
+        embed_single(ollama_url, EMBEDDING_MODEL, t, timeout=OLLAMA_EMBED_TIMEOUT)
         for t in texts
     ]
 
