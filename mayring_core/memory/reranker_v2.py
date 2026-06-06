@@ -59,8 +59,10 @@ _VERSION_RE = re.compile(r"^v\d+$")
 
 
 def _cache_dir() -> Path:
-    from mayring_core.config import CACHE_DIR
-    return CACHE_DIR
+    # WHY: frisch aufgelöst (nicht Modul-Level-Konstante) damit MAYRING_CACHE_DIR-env
+    # in Tests und Prod gleich wirkt — identisch zu model_router._text_override_model().
+    from mayring_core.config import _resolve_cache_dir, BASE_DIR
+    return _resolve_cache_dir(BASE_DIR)
 
 
 def _model_path(version: str = "v2") -> Path:
@@ -229,6 +231,66 @@ def delete_reranker_version(version: str) -> bool:
     return True
 
 
+def _active_path() -> Path:
+    return _cache_dir() / "rerank_active.json"
+
+
+def read_active_versions() -> list[str]:
+    """Return the list of 1–2 active reranker versions.
+
+    Falls back to migrating from ``rerank_default.txt`` when the new file
+    is absent or unreadable: a concrete value other than 'auto' becomes a
+    single-element list; 'auto' / missing → ['v1'] (safe baseline).
+    """
+    p = _active_path()
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(raw, list) and 1 <= len(raw) <= 2:
+            versions = [str(v).strip().lower() for v in raw]
+            if all(_VERSION_RE.match(v) or v == "v1" for v in versions):
+                return versions
+    except (OSError, FileNotFoundError, json.JSONDecodeError):
+        pass
+    # WHY: migrate from the old single-default file so existing installs don't
+    # fall back to a hardcoded constant when the new file is simply not yet written.
+    legacy = _read_runtime_default()
+    if legacy and legacy != "auto" and (_VERSION_RE.match(legacy) or legacy == "v1"):
+        return [legacy]
+    return ["v1"]
+
+
+def write_active_versions(versions: list[str]) -> list[str]:
+    """Persist 1–2 active reranker versions.
+
+    Each version must be 'v1' (baseline, no file required) or a 'v<N>'
+    whose model file exists in the cache directory.  Raises ValueError on
+    invalid input so callers get an explicit error instead of silent misrouting.
+    """
+    versions = [str(v).strip().lower() for v in versions]
+    if not 1 <= len(versions) <= 2:
+        raise ValueError(
+            f"active_versions must have 1 or 2 entries, got {len(versions)}"
+        )
+    for v in versions:
+        if not (_VERSION_RE.match(v) or v == "v1"):
+            raise ValueError(f"invalid version {v!r} — expected 'v1' or 'v<N>'")
+        if v != "v1" and not _model_path(v).exists():
+            raise ValueError(
+                f"no model file for {v!r} (rerank_{v}.json missing in cache)"
+            )
+    p = _active_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(versions), encoding="utf-8")
+    invalidate_v2_cache()
+    return versions
+
+
+def _ab_pick_pair(query_hint: str | None, versions: list[str]) -> str:
+    """Deterministic 50/50 split across exactly two versions using SHA-1."""
+    h = hashlib.sha1((query_hint or "").encode("utf-8")).hexdigest()
+    return versions[int(h, 16) % 2]
+
+
 def list_reranker_versions() -> list[dict[str, Any]]:
     """All selectable reranker versions for the dashboard table.
 
@@ -288,17 +350,26 @@ def get_active_reranker(
     Returns:
         (version, model_dict | None)
     """
-    raw = (
-        explicit_override
-        or os.getenv("RERANKER_VERSION")
-        or _read_runtime_default()
-        or "auto"
-    ).lower()
-    if raw != "auto" and raw != "v1" and not _VERSION_RE.match(raw):
-        raw = "auto"
-    if raw == "auto":
-        raw = _ab_pick(query_hint)
-    if raw != "v1":  # any learned version v<N>
+    # Explicit override and env var take precedence (highest priority).
+    pin = explicit_override or os.getenv("RERANKER_VERSION")
+    if pin:
+        raw = pin.strip().lower()
+        if raw not in ("auto", "v1") and not _VERSION_RE.match(raw):
+            raw = "auto"
+        if raw == "auto":
+            raw = _ab_pick(query_hint)
+        if raw != "v1":
+            model = _load_model(raw)
+            if model is None:
+                return "v1", None
+            return raw, model
+        return "v1", None
+
+    # New active-versions table: 1 entry → always that version;
+    # 2 entries → deterministic 50/50 hash split.
+    active = read_active_versions()
+    raw = active[0] if len(active) == 1 else _ab_pick_pair(query_hint, active)
+    if raw != "v1":
         model = _load_model(raw)
         if model is None:
             return "v1", None  # silent fallback — never crash on missing/degenerate model
