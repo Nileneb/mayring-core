@@ -287,7 +287,7 @@ def _active_category_pairs(conn: Any, chroma_categories: Any,
 
 def derive_query_category_ids(
     conn: Any, chroma_categories: Any, query_emb: list[float], *,
-    project_id: str | None = None, min_score: float = _HYBRID_MIN, top_n: int = 3,
+    project_id: str | None = None, min_score: float | None = None, top_n: int | None = None,
 ) -> set[int]:
     """Query-side mirror of link_chunks_deductive: map the query embedding to the
     codebook category_ids it most likely belongs to (cosine >= min_score, up to
@@ -295,9 +295,25 @@ def derive_query_category_ids(
     this only callers that pass category_hint get cat_match, so the session-hook
     path (which doesn't) left reranker-v3 inert even after chunk_categories was
     populated by the deductive ingest link. Cheap: 1 query emb x N cached category
-    embeddings. Fail-soft → empty set (no Chroma / no categories)."""
+    embeddings. Fail-soft → empty set (no Chroma / no categories).
+
+    WHY(#340): defaults waren min_score=_HYBRID_MIN(0.55)/top_n=3 — zu eng. Empirie
+    (cat-match-debug, 2026-06-06): die Kategorien der vektor-nah abgerufenen Chunks
+    (token_id, api_key_management …) ranken für die Query bei cosine ~0.51–0.53, also
+    KNAPP unter 0.55 → fielen raus → query↔chunk-Schnittmenge leer → cat_match inert.
+    Prosa-Kategorie-Embeddings matchen die Prosa-Query stärker als Code-Chunks, daher
+    braucht die Query-Seite ein etwas weiteres Fenster, damit ihre Kategorie-Menge die
+    der Chunks überlappt. Neue Defaults 0.50/8 (env-tunbar) holen genau diese Cluster
+    rein, ohne thematisch fremde Kategorien (top-8 der Auth-Query = alles auth/session/
+    token/api-key/user). Der cat_match-Boost ist klein (+0.08) → großzügigere Query-
+    Ableitung erhöht Recall kategorie-relevanter Treffer, kein Präzisionsrisiko."""
     if not query_emb:
         return set()
+    import os
+    if min_score is None:
+        min_score = float(os.getenv("MAYRING_QUERY_CAT_MIN_SCORE", "0.50"))
+    if top_n is None:
+        top_n = int(os.getenv("MAYRING_QUERY_CAT_TOP_N", "8"))
     pairs = _active_category_pairs(conn, chroma_categories, project_id)
     if not pairs:
         return set()
