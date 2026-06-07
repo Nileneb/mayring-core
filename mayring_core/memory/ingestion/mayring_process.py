@@ -11,10 +11,13 @@ See docs/superpowers/specs/2026-05-24-phase3-mayring-process.md.
 from __future__ import annotations
 
 import json as _json_mod
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
+
+_log = logging.getLogger(__name__)
 
 # WHY(canonical Mayring method): die EINE Schwelle für die Zuordnungs-Entscheidung —
 # matcht die ABGELEITETE Kategorie (Paraphrase→Generalisierung→Reduktion) eine
@@ -57,6 +60,81 @@ def _cosine(a: list[float], b: list[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+# WHY(goal-first-class v21/v22): der Goal (Mayring-Selektionskriterium) wird kanonisch
+# dedupliziert — identisch zur Kategorien-/RQ-Dedup, sonst entstünde wieder pro Source
+# ein eigener Goal-String (Prod-Befund: 6547/6641 ohne Anker, 2 distinct goals). Reuse
+# statt Fragment: gleicher konzeptueller Goal → eine goals-Zeile, an die Kategorien ankern.
+_GOAL_SIM_THRESHOLD = 0.85
+
+
+def upsert_canonical_goal(
+    conn: Any,
+    chroma_goals: Any,
+    goal_text: str,
+    goal_emb: list[float],
+    workspace_id: str,
+    project_id: str | None = None,
+    threshold: float = _GOAL_SIM_THRESHOLD,
+) -> int | None:
+    """Return the canonical goal id for *goal_text* (the Mayring Selektionskriterium).
+
+    Dedup, kein Fragment:
+      1. exakter Text in diesem Workspace → reuse (occurrence_count++),
+      2. sonst nächster Goal per Embedding-Cosine >= threshold → reuse,
+      3. sonst neuen Goal anlegen + Embedding in chroma_goals ("goals"-Collection).
+    *goal_emb* ist vorab berechnet (store/dieses Modul bleiben embedding-frei).
+    Gibt None nur bei leerem goal_text. Chroma-Fehler degradieren auf „neu anlegen"
+    (mit Log, nicht stumm)."""
+    text = (goal_text or "").strip()
+    if not text:
+        return None
+    now = _now_iso()
+
+    row = conn.execute(
+        "SELECT id FROM goals WHERE workspace_id=? AND text=?", (workspace_id, text)
+    ).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE goals SET occurrence_count=occurrence_count+1, updated_at=? "
+            "WHERE id=?", (now, row[0]))
+        return int(row[0])
+
+    if chroma_goals is not None and goal_emb:
+        try:
+            res = chroma_goals.query(
+                query_embeddings=[goal_emb], n_results=1,
+                where={"workspace_id": workspace_id})
+            dists = (res.get("distances") or [[]])[0]
+            metas = (res.get("metadatas") or [[]])[0]
+            if dists and metas and (1.0 - float(dists[0])) >= threshold:
+                gid = int(metas[0].get("goal_id"))
+                conn.execute(
+                    "UPDATE goals SET occurrence_count=occurrence_count+1, updated_at=? "
+                    "WHERE id=?", (now, gid))
+                return gid
+        except Exception as exc:  # noqa: BLE001 — degrade to create-new (logged, not silent)
+            _log.warning("goal canonicalization query failed (ws=%s): %s — neu anlegen",
+                         workspace_id, exc)
+
+    conn.execute(
+        "INSERT INTO goals(text, workspace_id, project_id, created_at, updated_at) "
+        "VALUES (?,?,?,?,?)", (text, workspace_id, project_id, now, now))
+    gid = int(conn.execute(
+        "SELECT id FROM goals WHERE workspace_id=? AND text=?",
+        (workspace_id, text)).fetchone()[0])
+    emb_id = f"goal:{gid}"
+    conn.execute("UPDATE goals SET embedding_id=? WHERE id=?", (emb_id, gid))
+    if chroma_goals is not None and goal_emb:
+        try:
+            chroma_goals.upsert(
+                ids=[emb_id], embeddings=[goal_emb], documents=[text],
+                metadatas=[{"workspace_id": workspace_id,
+                            "project_id": project_id or "", "goal_id": gid}])
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("goal embedding upsert failed (goal=%s): %s", gid, exc)
+    return gid
 
 
 def _load_categories(conn: Any, statuses: tuple[str, ...],
