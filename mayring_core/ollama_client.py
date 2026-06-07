@@ -34,6 +34,22 @@ _EMBED_RETRY_DELAYS = (3, 6, 12, 20, 30)
 _CLOUD_URL = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/")
 _CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY", "")
 
+
+def _default_keep_alive():
+    """Default keep_alive for LOCAL embed/generate calls.
+
+    WHY(VRAM-pin 2026-06-08): with the hot path consolidated to two small models
+    (bge-m3 embed ~0.65GB + qwen3.5-mayring:2b ~2GB = ~2.7GB, proven to coexist),
+    Ollama's default 5-min keep_alive still let each model evict the other under
+    concurrent embed+generate load → every call cold-loaded (2-17s) → /memory/search
+    + prompt-categorize blew the hook's 9s budget. Pinning both (keep_alive=-1) keeps
+    them resident. Override via OLLAMA_KEEP_ALIVE (-1=forever, "30m", 0=unload now)."""
+    v = os.getenv("OLLAMA_KEEP_ALIVE", "-1").strip()
+    return -1 if v == "-1" else v
+
+
+_KEEP_ALIVE = _default_keep_alive()
+
 # WHY(2026-05-10): User-Auftrag — cloud-fallback war über wochen bei 0%
 # usage weil cloud nur als RETRY-fallback bei local-error eingesprungen
 # wäre. Die freie tier-quota soll aktiv genutzt werden. Anteil X% (default
@@ -181,8 +197,9 @@ def generate(
         body["system"] = system
     if images:
         body["images"] = images
-    if keep_alive is not None:
-        body["keep_alive"] = keep_alive
+    # Pin the model by default (env OLLAMA_KEEP_ALIVE, -1=forever) so concurrent
+    # embed+generate don't evict each other; explicit caller value still wins.
+    body["keep_alive"] = keep_alive if keep_alive is not None else _KEEP_ALIVE
 
     merged_options: dict[str, Any] = {"num_predict": num_predict}
     if options:
@@ -289,7 +306,7 @@ def embed_batch(
     try:
         resp = httpx.post(
             f"{url.rstrip('/')}/api/embed",
-            json={"model": model, "input": texts},
+            json={"model": model, "input": texts, "keep_alive": _KEEP_ALIVE},
             timeout=timeout,
             verify=_SSL_VERIFY,
         )
@@ -326,7 +343,7 @@ def embed_single(
         try:
             resp = httpx.post(
                 f"{base}/api/embeddings",
-                json={"model": model, "prompt": text},
+                json={"model": model, "prompt": text, "keep_alive": _KEEP_ALIVE},
                 timeout=timeout,
                 verify=_SSL_VERIFY,
             )
@@ -388,8 +405,9 @@ def chat(
         body["tools"] = tools
     if options is not None:
         body["options"] = options
-    if keep_alive is not None:
-        body["keep_alive"] = keep_alive
+    # Pin the model by default (env OLLAMA_KEEP_ALIVE, -1=forever) so concurrent
+    # embed+generate don't evict each other; explicit caller value still wins.
+    body["keep_alive"] = keep_alive if keep_alive is not None else _KEEP_ALIVE
 
     base = url.rstrip("/")
     # Cloud-primary X% mit local als reverse-fallback (gleicher anteil wie
