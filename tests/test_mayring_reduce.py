@@ -91,7 +91,14 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypat
 
     # Monkeypatch record_proposal mit der NEUEN Signatur (ohne codebook_id).
     # Der Controller in MayringCoder/src/api/routes/codebooks.py passt die Definition an.
-    import src.api.routes.codebooks as _codebooks_mod
+    # WHY(core-standalone 2026-06-08): dieser Test prüft die CONSUMER-Integration
+    # (MayringCoder src/). Im core-eigenen CI existiert `src` nicht → sauber skippen
+    # statt hart zu failen; im Consumer (vendored) läuft er normal.
+    import pytest as _pytest
+    _codebooks_mod = _pytest.importorskip(
+        "src.api.routes.codebooks",
+        reason="consumer-only (MayringCoder src/) — skipped in core-standalone",
+    )
 
     def _fake_record_proposal(conn, candidate_label, *, paraphrase="",
                               parent_hint_id=None, igio_axis=None, pi_job_id="",
