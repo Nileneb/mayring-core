@@ -439,6 +439,13 @@ def _llm_relevance_scores(
             ollama_url, model, prompt,
             stream=False, num_predict=256, timeout=timeout,
             max_retries=1, keep_alive=_ADVISOR_KEEP_ALIVE,
+            # WHY(thinking-trap 2026-06-08): the advisor model is now a thinking-capable
+            # qwen3.5 distillation. On a complex relevance prompt it emits a huge <think>
+            # chain (measured: 36s / 4013 tokens vs 1.5s / 133 with think off) — the
+            # num_predict=256 cap just truncates mid-reasoning so </think> never closes →
+            # empty score map (advisor inert) AND the call still burns the budget. The
+            # advisor needs a structured JSON verdict, not reasoning → force think off.
+            think=False,
         )
     except (ConnectionError, TimeoutError, OSError, ValueError):
         return {}
