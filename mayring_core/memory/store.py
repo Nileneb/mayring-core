@@ -1983,6 +1983,42 @@ def log_llm_call(
     conn.commit()
 
 
+def log_llm_call_async(
+    call_type: str,
+    model: str,
+    prompt: str,
+    response: str,
+    tool_calls: int = 0,
+    duration_ms: int = 0,
+    workspace_id: str = "default",
+    db_path: "Path | None" = None,
+) -> None:
+    """Fire-and-forget telemetry write on a daemon thread with its OWN connection.
+
+    WHY(write-contention 2026-06-07): the synchronous log_llm_call(conn, ...) on the
+    request's connection holds the HTTP worker on the single SQLite write lock (WAL
+    serializes writers; busy_timeout makes them WAIT, not error). Under sustained
+    pi-claim/ingest load that turned a read-mostly /memory/search into an 8-14s block —
+    worker blocked on the lock, CPU ~0%. Backgrounding the telemetry insert keeps the
+    hot path off the lock entirely: search returns as soon as its real work (embed +
+    Chroma + rerank) is done; the log row lands whenever the writer queue drains.
+    SQLite connections are not thread-safe, so the thread opens a fresh one."""
+    import threading
+
+    def _write() -> None:
+        try:
+            conn = init_memory_db(db_path or MEMORY_DB_PATH)
+            try:
+                log_llm_call(conn, call_type, model, prompt, response,
+                             tool_calls, duration_ms, workspace_id)
+            finally:
+                conn.close()
+        except Exception:
+            pass  # best-effort telemetry — never surface from a background thread
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # wiki_paper_cache helpers
 # ---------------------------------------------------------------------------
