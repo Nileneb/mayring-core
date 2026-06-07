@@ -173,6 +173,7 @@ def generate(
     options: dict | None = None,
     keep_alive: str | None = None,
     response_format: str | None = None,
+    cloud_primary: bool | None = None,
 ) -> str:
     """POST to /api/generate and return the complete response text.
 
@@ -216,7 +217,10 @@ def generate(
     # WHY(2026-05-10 cloud-primary-routing): X% der calls direkt an cloud
     # (free-tier quota nutzen) — wenn cloud fail't, fallback auf local.
     # Reduziert local-overload UND nutzt die kostenlose cloud-quota.
-    if _should_route_cloud_primary():
+    # cloud_primary=False forces a latency-critical hot-path call (e.g. the inline search
+    # advisor) to stay LOCAL — the 50% cloud-split routes to a slower cloud model
+    # (gemma3:4b) and added 4-8s of variance per /memory/search, blowing the hook budget.
+    if cloud_primary is not False and _should_route_cloud_primary():
         try:
             cloud_model = _resolve_cloud_model(model)
             cloud_body = dict(body, model=cloud_model)

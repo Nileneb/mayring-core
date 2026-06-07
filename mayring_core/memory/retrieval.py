@@ -446,6 +446,10 @@ def _llm_relevance_scores(
             # empty score map (advisor inert) AND the call still burns the budget. The
             # advisor needs a structured JSON verdict, not reasoning → force think off.
             think=False,
+            # Latency-critical inline hot-path → never cloud-split. The 50% cloud-primary
+            # split routed half the advisor calls to a slower cloud model (gemma3:4b),
+            # adding 4-8s variance per search; the local GPU answers in ~1.3s.
+            cloud_primary=False,
         )
     except (ConnectionError, TimeoutError, OSError, ValueError):
         return {}
