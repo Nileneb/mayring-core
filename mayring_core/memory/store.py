@@ -143,7 +143,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 20  # v20: sources.categorize_goal (Goal-Anchor persistieren)
+CURRENT_SCHEMA_VERSION = 21  # v21: goals first-class (goals-Tabelle + categories.goal_id Anker)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -300,6 +300,13 @@ def _migrate_schema(conn: DBAdapter) -> None:
         # exists, so this entry is a no-op on fully-migrated DBs.
         "codebook_categories": [
             ("project_id", "TEXT DEFAULT NULL"),
+        ],
+        # v21 goal-first-class: Goal-Anker auf der Kategorie. Additiv+nullable
+        # (FK→goals.id); existierende Kategorien bekommen NULL (kein Goal bekannt)
+        # bis der breite Re-Ingest sie goal-anchored neu bildet. Die goals-Tabelle
+        # wird im DDL-Block VOR _migrate_schema angelegt → FK-Ziel existiert.
+        "categories": [
+            ("goal_id", "INTEGER REFERENCES goals(id)"),
         ],
     }
     existing_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -885,10 +892,18 @@ def _init_schema(conn: DBAdapter) -> None:
             patterns        TEXT NOT NULL DEFAULT '[]',
             promoted_at     TEXT,
             project_id      TEXT DEFAULT NULL,
+            -- v21: Goal-Anker (Mayring goal-anchored). NULL = Legacy/geteilte Basis
+            -- (vor v21 induziert, kein Goal bekannt). Goal-gescopte Eindeutigkeit
+            -- (UNIQUE(goal_id,name)) folgt im UNIQUE-Rebuild; hier additiv+nullable.
+            goal_id         INTEGER REFERENCES goals(id),
             UNIQUE (name)
         );
         CREATE INDEX IF NOT EXISTS idx_categories_status
             ON categories(status);
+        -- idx_categories_goal wird NACH _migrate_schema angelegt (v21): auf einer
+        -- Legacy-DB existiert categories.goal_id erst nach dem ALTER. Index hier im
+        -- DDL-Block würde auf pre-v21-DBs "no such column: goal_id" werfen
+        -- (v14/v19-Lehre — Index nie vor der spaltenanlegenden Migration).
         CREATE TABLE IF NOT EXISTS codebook_proposals (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             category_id     INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -1034,6 +1049,27 @@ def _init_schema(conn: DBAdapter) -> None:
             goal        TEXT NOT NULL DEFAULT '',
             updated_at  TEXT NOT NULL DEFAULT ''
         );
+
+        -- goals (v21): Goal als FIRST-CLASS Entity = das Mayring-Selektionskriterium.
+        -- Bisher lag das Goal nur als Freitext pro Source (source_goals) → derselbe
+        -- konzeptuelle Goal mehrfach erfasst, und Kategorien hatten KEINEN Goal-Anker
+        -- (global UNIQUE(name), project_id nie gesetzt) → goal→category-Verknüpfung
+        -- nur transitiv+degeneriert rekonstruierbar. goals dedupliziert kanonisch per
+        -- Embedding-Cosine (wie research_questions/Kategorien); categories.goal_id
+        -- ankert jede Kategorie an ihr Goal → goal-anchored Mayring-Methode.
+        CREATE TABLE IF NOT EXISTS goals (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            text             TEXT NOT NULL,
+            workspace_id     TEXT NOT NULL DEFAULT 'default',
+            project_id       TEXT DEFAULT NULL,
+            embedding_id     TEXT NOT NULL DEFAULT '',
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            created_at       TEXT NOT NULL DEFAULT '',
+            updated_at       TEXT NOT NULL DEFAULT '',
+            UNIQUE (workspace_id, text)
+        );
+        CREATE INDEX IF NOT EXISTS idx_goals_workspace ON goals(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_goals_project ON goals(project_id);
 
         -- Workspace-Identity-Foundation. Bisher war workspace_id ein
         -- freier String den jeder Code-Pfad anders auflöste:
@@ -1194,6 +1230,12 @@ def _init_schema(conn: DBAdapter) -> None:
 
     # Migration v5→v6: devices PK device_id → (device_id, workspace_id) (#274 review)
     _migrate_devices_composite_pk(conn)
+
+    # v21: categories.goal_id index — created AFTER _migrate_schema so it exists
+    # on legacy DBs where goal_id was just ALTER-added (v14/v19-Lehre).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_categories_goal ON categories(goal_id)"
+    )
 
     # Indexes for workspace_id filtering
     conn.execute(
