@@ -48,6 +48,13 @@ def get_chroma_collection(
     server owns the persist dir); it still selects the dir for the embedded
     fallback used by tests/standalone (``MAYRING_CHROMA_HOST`` unset).
     """
+    # WHY(bge-m3-migration): blue-green cutover switches the live read/write
+    # collection via env without editing the ~6 hardcoded call-sites. Only the
+    # default "memory_chunks" name is remapped; codebook_categories/overview
+    # pass through unchanged (re-embedded in-place at flip time).
+    if name == "memory_chunks":
+        name = os.getenv("MEMORY_CHUNKS_COLLECTION", "memory_chunks")
+
     try:
         import chromadb
     except ImportError:

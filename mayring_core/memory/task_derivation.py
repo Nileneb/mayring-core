@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -32,8 +33,9 @@ _log = logging.getLogger(__name__)
 
 # WHY(2026-05-11): 0.85 ist empirisch — gleicher prompt-thema clustert
 # >0.85 mit nomic-embed-text. Niedriger = task-fragmentation; höher =
-# duplikate. Anpassbar via env wenn nötig.
-_TASK_SIM_THRESHOLD = 0.85
+# duplikate. WHY(bge-m3-migration): raw-cosine-Schwelle ist modellspezifisch
+# (bge-m3 spreizt breiter als nomic) → env-tunbar für die Rekalibrierung.
+_TASK_SIM_THRESHOLD = float(os.getenv("MAYRING_TASK_SIM_THRESHOLD", "0.85"))
 
 _TASK_DERIVATION_PROMPT = """Du extrahierst aus einem User-Prompt EINE Forschungsfrage/Task im Stil der Mayring-Inhaltsanalyse.
 
