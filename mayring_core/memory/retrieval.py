@@ -451,7 +451,12 @@ def _llm_relevance_scores(
             # adding 4-8s variance per search; the local GPU answers in ~1.3s.
             cloud_primary=False,
         )
-    except (ConnectionError, TimeoutError, OSError, ValueError):
+    except Exception as exc:
+        # The advisor is BEST-EFFORT: ANY failure must degrade to no-scores, never 500
+        # the search. The narrow tuple before missed httpx.ReadTimeout (httpx.TimeoutException
+        # is NOT a builtin TimeoutError) from the cloud fallback → it propagated to
+        # /memory/search as a 500 on every hook prompt. Catch broadly and degrade.
+        _log.warning("llm advisor failed (best-effort skip): %s", type(exc).__name__)
         return {}
     data = _parse_score_map(raw)
     scores: dict[str, float] = {}
@@ -1141,7 +1146,20 @@ def search(
             + vector_scores.get(c.chunk_id, 0.0),
             reverse=True,
         )[:ADVISOR_TOP_N]
-        llm_model = opts.get("llm_prefilter_model", "mistral:7b-instruct")
+        # WHY(no-hardcoded-model 2026-06-08): the advisor model comes from the
+        # ModelRouter ('text' task → text_model.txt / config/model_routes.yaml), NOT a
+        # hardcoded default. A client (the memory-inject hook) hardcoding it overrode the
+        # router and forced a local→cloud fallback (ReadTimeout → 500); the old hardcoded
+        # "mistral:7b-instruct" default here was the same anti-pattern. Resolve from the
+        # router; an explicit opts override still wins. mistral is only a last-resort
+        # fallback if the router itself fails.
+        llm_model = opts.get("llm_prefilter_model")
+        if not llm_model:
+            try:
+                from mayring_core.model_router import ModelRouter
+                llm_model = ModelRouter(ollama_url).resolve("text")
+            except Exception:
+                llm_model = "mistral:7b-instruct"
         llm_scores = _llm_relevance_scores(
             query, pre, ollama_url,
             model=llm_model,

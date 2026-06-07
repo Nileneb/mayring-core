@@ -26,3 +26,19 @@ def test_advisor_forces_think_off(monkeypatch):
     assert captured.get("think") is False  # MUST disable thinking
     assert captured.get("cloud_primary") is False  # hot-path → never cloud-split
     assert scores.get("chk_0") == 0.9
+
+
+def test_advisor_degrades_on_any_error_not_500(monkeypatch):
+    """Advisor is best-effort: ANY generate exception (incl. httpx.ReadTimeout, which is
+    NOT a builtin TimeoutError) must return {} so /memory/search never 500s."""
+    import httpx
+
+    def _boom(*a, **k):
+        raise httpx.ReadTimeout("cloud fallback timed out")
+
+    monkeypatch.setattr("mayring_core.ollama_client.generate", _boom)
+    cands = [Chunk(chunk_id="chk_0", source_id="s", chunk_level="event", ordinal=0,
+                   text="x", text_hash="sha256:a", created_at="2026-06-08")]
+    # must NOT raise
+    scores = retrieval._llm_relevance_scores("q", cands, "http://gpu:11434", model="qwen3.5-mayring:2b")
+    assert scores == {}
