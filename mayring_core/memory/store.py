@@ -143,7 +143,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 21  # v21: goals first-class (goals-Tabelle + categories.goal_id Anker)
+CURRENT_SCHEMA_VERSION = 22  # v22: categories UNIQUE(name)→UNIQUE(goal_id,name) (goal-gescopt)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -690,6 +690,82 @@ def _migrate_codebook_collapse(conn: DBAdapter) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
 
 
+def _migrate_categories_goal_unique(conn: DBAdapter) -> None:
+    """v22: categories UNIQUE(name) → UNIQUE(goal_id, name) (goal-gescopt).
+
+    WHY: goal-anchored Mayring — derselbe Kategoriename darf unter verschiedenen
+    Goals existieren. UNIQUE(name) erzwang Cross-Goal-Merge. SQLite kann UNIQUE
+    nicht in-place ändern → in-place-Rebuild unter GLEICHEM Namen "categories", damit
+    die dependent FKs (chunk_categories.category_id, self parent_id) wieder binden
+    (analog _migrate_codebook_collapse). MUSS NACH _migrate_schema laufen (das
+    goal_id per ALTER anlegt). Idempotent + geguardet (v14-Lehre: darf init NIE
+    bricken). Die Basis-Eindeutigkeit (goal_id IS NULL) sichert danach der partielle
+    Index ux_categories_base_name (init legt ihn nach dieser Migration an)."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "categories" not in tables:
+        return  # frische DB: DDL legt direkt UNIQUE(goal_id,name) an
+    ddl_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='categories'"
+    ).fetchone()
+    ddl = (ddl_row[0] if ddl_row else "") or ""
+    if "goal_id" not in ddl:
+        return  # goal_id noch nicht da (sollte nach _migrate_schema nie passieren)
+    if "UNIQUE(goal_id,name)" in ddl.replace(" ", ""):
+        return  # schon goal-gescopt
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        # legacy ON: dependents behalten ihre Referenz auf "categories"; die
+        # frisch erzeugte gleichnamige Tabelle erbt sie. Kein Rename-back nötig
+        # (Name bleibt "categories").
+        conn.execute("DROP TABLE IF EXISTS categories_old_v22")
+        conn.execute("ALTER TABLE categories RENAME TO categories_old_v22")
+        conn.execute(
+            """
+            CREATE TABLE categories (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
+                parent_id       INTEGER REFERENCES categories(id),
+                description     TEXT NOT NULL DEFAULT '',
+                examples        TEXT NOT NULL DEFAULT '[]',
+                status          TEXT NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active','proposed','deprecated')),
+                source          TEXT NOT NULL DEFAULT 'imported'
+                                CHECK (source IN ('manual','induced','imported')),
+                evidence_count  INTEGER NOT NULL DEFAULT 0,
+                embedding_id    TEXT NOT NULL DEFAULT '',
+                risk_level      TEXT NOT NULL DEFAULT '',
+                languages       TEXT NOT NULL DEFAULT '[]',
+                patterns        TEXT NOT NULL DEFAULT '[]',
+                promoted_at     TEXT,
+                project_id      TEXT DEFAULT NULL,
+                goal_id         INTEGER REFERENCES goals(id),
+                UNIQUE (goal_id, name)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO categories "
+            "(id,name,igio_axis,parent_id,description,examples,status,source,"
+            "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,"
+            "project_id,goal_id) "
+            "SELECT id,name,igio_axis,parent_id,description,examples,status,source,"
+            "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,"
+            "project_id,goal_id FROM categories_old_v22"
+        )
+        conn.execute("DROP TABLE categories_old_v22")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def _migrate_devices_composite_pk(conn: DBAdapter) -> None:
     """Rebuild `devices` with PK (device_id, workspace_id) — migration v5→v6.
 
@@ -893,10 +969,14 @@ def _init_schema(conn: DBAdapter) -> None:
             promoted_at     TEXT,
             project_id      TEXT DEFAULT NULL,
             -- v21: Goal-Anker (Mayring goal-anchored). NULL = Legacy/geteilte Basis
-            -- (vor v21 induziert, kein Goal bekannt). Goal-gescopte Eindeutigkeit
-            -- (UNIQUE(goal_id,name)) folgt im UNIQUE-Rebuild; hier additiv+nullable.
+            -- (vor v21 induziert, kein Goal bekannt).
             goal_id         INTEGER REFERENCES goals(id),
-            UNIQUE (name)
+            -- v22: goal-gescopte Eindeutigkeit — derselbe Kategoriename darf unter
+            -- verschiedenen Goals existieren (kein Cross-Goal-Merge mehr). Für die
+            -- Legacy/Basis (goal_id IS NULL) erzwingt der partielle Unique-Index
+            -- ux_categories_base_name weiter globale Eindeutigkeit (SQLite behandelt
+            -- NULL in UNIQUE als distinct → ohne den Index keine Basis-Dedup).
+            UNIQUE (goal_id, name)
         );
         CREATE INDEX IF NOT EXISTS idx_categories_status
             ON categories(status);
@@ -1231,10 +1311,19 @@ def _init_schema(conn: DBAdapter) -> None:
     # Migration v5→v6: devices PK device_id → (device_id, workspace_id) (#274 review)
     _migrate_devices_composite_pk(conn)
 
-    # v21: categories.goal_id index — created AFTER _migrate_schema so it exists
-    # on legacy DBs where goal_id was just ALTER-added (v14/v19-Lehre).
+    # v22: categories UNIQUE(name) → UNIQUE(goal_id, name). MUSS nach _migrate_schema
+    # (goal_id-ALTER) laufen.
+    _migrate_categories_goal_unique(conn)
+
+    # v21/v22: categories-Indizes — NACH _migrate_schema/-rebuild, damit goal_id auf
+    # Legacy-DBs existiert (v14/v19-Lehre). Der partielle Unique-Index hält die
+    # Basis (goal_id IS NULL) global eindeutig (SQLite-NULL-Distinctness umgehen).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_categories_goal ON categories(goal_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_categories_base_name "
+        "ON categories(name) WHERE goal_id IS NULL"
     )
 
     # Indexes for workspace_id filtering
