@@ -449,6 +449,32 @@ def ingest(
             except Exception as exc:  # WHY: Anker-Persistenz darf den Ingest nie failen
                 _log.warning("source_goals persist failed (source=%s): %s",
                              source.source_id, exc)
+
+            # v21/v22 goal-first-class (Phase B): NUR bei einem ECHTEN Task (nicht dem
+            # "Inhalte aus …"-Fallback) den Goal kanonisch anlegen (goals-Tabelle, dedup)
+            # + die in DIESEM Ingest FRISCH induzierten Kategorien an ihn ankern (goal_id).
+            # Macht goal→category strukturell statt nur transitiv über source_goals. Der
+            # Fallback würde die goals-Tabelle mit Müll-Ankern fluten → bewusst ausgeschlossen.
+            # Fail-soft: darf den Ingest nie failen.
+            real_task = categorize_task.strip()
+            if real_task:
+                try:
+                    from mayring_core.memory.ingestion.mayring_process import upsert_canonical_goal
+                    _gemb = _embed_batch([real_task[:2000]], ollama_url)
+                    goal_id = upsert_canonical_goal(
+                        conn, get_chroma_collection("goals"), real_task,
+                        _gemb[0] if _gemb else [], workspace_id, project_id=link_project_id)
+                    if goal_id is not None:
+                        for r in results:
+                            if (r.category_id is not None
+                                    and (r.decision or "").startswith("induct")):
+                                conn.execute(
+                                    "UPDATE categories SET goal_id=? "
+                                    "WHERE id=? AND goal_id IS NULL", (goal_id, r.category_id))
+                        conn.commit()
+                except Exception as exc:  # WHY: Goal-Anker darf den Ingest nie failen
+                    _log.warning("goal canonicalization/anchor failed (source=%s): %s",
+                                 source.source_id, exc)
             # call_type='categorization' loggen: das ist jetzt der KANONISCHE Producer
             # (die EINE Methode) — früher tat das nur das tote mayring_categorize, sodass
             # der categorization-Observability-Metric (/stats/llm-call-types) keinen
