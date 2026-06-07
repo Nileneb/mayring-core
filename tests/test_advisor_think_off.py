@@ -24,4 +24,5 @@ def test_advisor_forces_think_off(monkeypatch):
     scores = retrieval._llm_relevance_scores("reranker", cands, "http://gpu:11434",
                                              model="qwen3.5-mayring:2b")
     assert captured.get("think") is False  # MUST disable thinking
+    assert captured.get("cloud_primary") is False  # hot-path → never cloud-split
     assert scores.get("chk_0") == 0.9
