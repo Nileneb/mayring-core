@@ -143,7 +143,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 22  # v22: categories UNIQUE(name)→UNIQUE(goal_id,name) (goal-gescopt)
+CURRENT_SCHEMA_VERSION = 23  # v23: notification_state (Ampel-Notification-Center Seen/Ack)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -1288,6 +1288,20 @@ def _init_schema(conn: DBAdapter) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_hook_events_ws_fired
             ON hook_events(workspace_id, fired_at);
+
+        -- notification_state (v23): Seen/Ack-Status je hook_event für das
+        -- Ampel-Notification-Center. DRY: hook_events bleibt Source-of-Truth
+        -- (Klassifikation + repo/project-Zuordnung deterministisch on-read), hier
+        -- liegt NUR der user-facing Triage-State. Ein fehlender Eintrag = ungelesen.
+        CREATE TABLE IF NOT EXISTS notification_state (
+            hook_event_id INTEGER PRIMARY KEY REFERENCES hook_events(id) ON DELETE CASCADE,
+            workspace_id  TEXT NOT NULL DEFAULT 'default',
+            seen          INTEGER NOT NULL DEFAULT 0,
+            acked         INTEGER NOT NULL DEFAULT 0,
+            updated_at    TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_state_ws
+            ON notification_state(workspace_id, acked);
     """)
 
     # v16 (tenancy phase B): per-workspace role permission overrides.
