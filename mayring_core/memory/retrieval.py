@@ -1086,9 +1086,12 @@ def search(
     # that was overcautious and turned a real feature into dead UI.
     import os as _os
     try:
-        from mayring_core.memory.store import log_llm_call
-        log_llm_call(
-            conn,
+        # WHY(write-contention 2026-06-07): use the async (daemon-thread, own-conn)
+        # variant — the synchronous insert on `conn` held the request worker on the
+        # single SQLite write lock under sustained pi-claim/ingest load, blocking this
+        # read-mostly search for 8-14s. Telemetry must never sit on the hot path.
+        from mayring_core.memory.store import log_llm_call_async
+        log_llm_call_async(
             call_type="vector_search",
             model=_os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
             prompt=query[:200],
