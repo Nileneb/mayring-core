@@ -143,7 +143,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 23  # v23: notification_state (Ampel-Notification-Center Seen/Ack)
+CURRENT_SCHEMA_VERSION = 24  # v24: DROP dead integration_notifications (#270-Cleanup)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -1380,6 +1380,13 @@ def _init_schema(conn: DBAdapter) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(workspace_id, external_id)"
     )
+
+    # v24 (#270-Cleanup): das alte integration_notifications-Subsystem (MayringCoder
+    # src/api/integrations/notifications_store.py) ist entfernt — kein Producer hat je
+    # darauf geschrieben (lebende Pipeline = GitHub-Action → /repo-events → hook_events).
+    # Die leere Tabelle bleibt sonst inert in jeder Prod-DB liegen. DROP IF EXISTS ist
+    # idempotent (no-op auf Fresh-DBs, die sie nie hatten).
+    conn.execute("DROP TABLE IF EXISTS integration_notifications")
 
     # System-Workspace seedet sich beim DB-init. Verwendet von Service-
     # Tokens (src/api/auth.py:37), post-deploy-ingest, conversation_watcher,
