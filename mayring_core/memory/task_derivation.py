@@ -62,22 +62,21 @@ User-Prompt: """
 
 
 def _embed_text(text: str, ollama_url: str) -> Optional[list[float]]:
-    """Embed via nomic-embed-text. Returns None on failure (caller must handle)."""
+    """Embed the query for research-question matching via the configured embedding
+    model (bge-m3), routed through ollama_client so it sends keep_alive.
+
+    WHY(VRAM-thrash + hot-path 2026-06-08): this previously hardcoded nomic-embed-text
+    and POSTed Ollama directly (no keep_alive). It runs on EVERY /memory/search (in
+    derive_research_question_fast). After the store moved to bge-m3, nomic was a dead
+    embedding model — so each search cold-loaded nomic (2-6s) AND added a 3rd model to
+    the GPU, evicting the pinned bge-m3/qwen → the search-handler stall. Using the
+    pinned bge-m3 removes nomic entirely and makes this a ~0.2s warm call. (Stored RQ
+    vectors that are still 768d simply yield cosine 0.0 → no match → background
+    re-derivation, which is non-fatal; re-embed RQs to refresh matching.)"""
     try:
-        import requests
-        resp = requests.post(
-            ollama_url.rstrip("/") + "/api/embed",
-            json={"model": "nomic-embed-text", "input": text},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            _log.warning("task-derive embed HTTP %s", resp.status_code)
-            return None
-        data = resp.json()
-        embeddings = data.get("embeddings") or [data.get("embedding")]
-        if embeddings and embeddings[0]:
-            return list(embeddings[0])
-        return None
+        from mayring_core.config import EMBEDDING_MODEL
+        from mayring_core.ollama_client import embed_single
+        return embed_single(ollama_url, EMBEDDING_MODEL, text, timeout=15)
     except Exception as e:
         _log.warning("task-derive embed failed: %s", e)
         return None
