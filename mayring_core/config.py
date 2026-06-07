@@ -68,7 +68,7 @@ MAX_CONTEXT_CHARS = 6000  # ~500 tokens
 
 # RAG context (Phase 2: ChromaDB similarity search)
 RAG_TOP_K = 5                          # Number of similar context entries to inject
-EMBEDDING_MODEL = "nomic-embed-text"   # Ollama embedding model (offline)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")  # Ollama embedding model; env-switch to bge-m3 (multilingual) in prod
 
 # Ollama
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))
