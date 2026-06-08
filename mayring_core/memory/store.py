@@ -80,6 +80,48 @@ def get_chroma_collection(
             _chroma_clients[chroma_path] = chromadb.PersistentClient(path=chroma_path)
         _chroma_collections[key] = _chroma_clients[chroma_path].get_or_create_collection(name)
     return _chroma_collections[key]
+def reset_chroma_collection(name: str, path: "str | Path | None" = None):
+    """Drop + recreate a Chroma collection and clear the singleton caches.
+
+    WHY(bge-m3-migration dim-mismatch 2026-06-08): a collection is dim-locked at the
+    embedding size it was created with. After the store moved nomic(768)→bge-m3(1024),
+    every re-embed into an old 768d collection raised "Collection expecting embedding
+    with dimension of 768, got 1024" — it bit memory_sync (local), reembed-categories
+    (codebook_categories) and the migration. This is the one reusable self-heal: callers
+    catch the dim error, call this, and retry the upsert against the fresh collection.
+    Honours the same MAYRING_CHROMA_HOST / embedded-path resolution as
+    get_chroma_collection and evicts the cached client/collection entries."""
+    try:
+        import chromadb  # noqa: F401
+    except ImportError:
+        return None
+    if name == "memory_chunks":
+        name = os.getenv("MEMORY_CHUNKS_COLLECTION", "memory_chunks")
+    host = os.getenv("MAYRING_CHROMA_HOST")
+    if host:
+        port = int(os.getenv("MAYRING_CHROMA_PORT", "8000"))
+        ckey = f"http://{host}:{port}"
+        client = _chroma_clients.get(ckey)
+        if client is None:
+            client = _chroma_clients.setdefault(
+                ckey, chromadb.HttpClient(host=host, port=port))
+        try:
+            client.delete_collection(name)
+        except Exception:
+            pass  # not-found is fine — we're about to (re)create it
+        _chroma_collections.pop(f"{ckey}::{name}", None)
+    else:
+        chroma_path = str(path or CACHE_DIR / "memory_chroma")
+        client = _chroma_clients.get(chroma_path)
+        if client is not None:
+            try:
+                client.delete_collection(name)
+            except Exception:
+                pass
+        _chroma_collections.pop(f"{chroma_path}::{name}", None)
+    return get_chroma_collection(name, path=path)
+
+
 from mayring_core.memory.schema import Chunk, Source
 
 MEMORY_DB_PATH: Path = CACHE_DIR / "memory.db"
