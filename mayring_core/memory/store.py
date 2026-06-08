@@ -1505,6 +1505,18 @@ def upsert_source(
     eff_org_id = org_id if org_id is not None else source.org_id
     eff_user_id = user_id if user_id is not None else source.user_id
     eff_scope_key = scope_key if scope_key is not None else source.scope_key
+    # WHY(owner-attribution 2026-06-08): a private source with no user_id is
+    # unreachable — build_chroma_where / _scope_filter require user_id = caller, so it
+    # matches nobody (dead, ungoverned data). Service-token ingests (populate, ambient,
+    # repo-events; info.sub=None) used to write private+user_id=NULL here. Fall back to
+    # the workspace owner at the single persist chokepoint so EVERY path is covered, not
+    # just the endpoints that remembered to stamp it (/memory/put, /conversation).
+    if eff_visibility == "private" and not eff_user_id:
+        try:
+            from mayring_core.identity.workspace_resolver import workspace_owner
+            eff_user_id = workspace_owner(conn, workspace_id) or eff_user_id
+        except Exception:  # noqa: BLE001 — owner lookup must never block ingest
+            pass
     conn.execute(
         """
         INSERT INTO sources
