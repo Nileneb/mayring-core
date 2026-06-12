@@ -158,7 +158,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       statt fake-separate workspace_ids.
 #   v8 (#workspace-uuid-sot): projects.{owner_id, source_type, source_ref} —
 #       Projekt-Diagramm: ein Projekt hat einen Owner + eine Source (github-Repo
-#       ODER papers/research). Goals↔Project (M:M, IGIO) = Backend-Designfrage offen.
+#       ODER papers/research). Goals↔Project (M:M) = Backend-Designfrage offen.
 #   v9 (#workspace-uuid-sot v2.0 Phase 1): codebook-in-DB (codebooks,
 #       codebook_categories, codebook_proposals, chunk_categories) — Codebook aus
 #       YAML → SQLite, Category-Embeddings → Chroma-Collection "codebook_categories".
@@ -185,7 +185,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 24  # v24: DROP dead integration_notifications (#270-Cleanup)
+CURRENT_SCHEMA_VERSION = 25  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -262,9 +262,6 @@ def _migrate_schema(conn: DBAdapter) -> None:
             ("project_id", "TEXT DEFAULT NULL"),
             ("category_source", "TEXT NOT NULL DEFAULT ''"),
             ("category_confidence", "REAL NOT NULL DEFAULT 0.0"),
-            ("igio_axis", "TEXT NOT NULL DEFAULT ''"),
-            ("igio_confidence", "REAL NOT NULL DEFAULT 0.0"),
-            ("igio_classified_at", "TEXT NOT NULL DEFAULT ''"),
             ("user_id", "TEXT DEFAULT NULL"),
         ],
         # pi_jobs Phase 2: cloud-routable jobs need a worker_id, capability,
@@ -362,6 +359,19 @@ def _migrate_schema(conn: DBAdapter) -> None:
 
     _migrate_rename_research_questions(conn)
     _migrate_visibility_check(conn)
+    _drop_legacy_igio_columns(conn)
+
+
+def _drop_legacy_igio_columns(conn: DBAdapter) -> None:
+    # WHY(igio-removal 2026-06-12): IGIO-Achse abgeschafft — Spalten auf
+    # Bestands-DBs wegräumen statt tote Daten zu schleppen. DROP COLUMN
+    # braucht SQLite >=3.35; ältere DBs behalten die Spalte (harmlos, kein Reader).
+    for table, col in (("chunks", "igio_axis"), ("chunks", "igio_confidence"),
+                       ("chunks", "igio_classified_at"), ("categories", "igio_axis")):
+        try:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        except Exception:
+            pass  # Spalte existiert nicht (neue DB) oder SQLite <3.35
 
 
 def _migrate_rename_research_questions(conn: DBAdapter) -> None:
@@ -689,7 +699,6 @@ def _migrate_codebook_collapse(conn: DBAdapter) -> None:
             CREATE TABLE codebook_categories (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 name            TEXT NOT NULL,
-                igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
                 parent_id       INTEGER REFERENCES codebook_categories(id),
                 description     TEXT NOT NULL DEFAULT '',
                 examples        TEXT NOT NULL DEFAULT '[]',
@@ -710,9 +719,9 @@ def _migrate_codebook_collapse(conn: DBAdapter) -> None:
         )
         conn.execute(
             "INSERT INTO codebook_categories "
-            "(id,name,igio_axis,parent_id,description,examples,status,source,"
+            "(id,name,parent_id,description,examples,status,source,"
             "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,project_id) "
-            "SELECT id,name,igio_axis,parent_id,description,examples,status,source,"
+            "SELECT id,name,parent_id,description,examples,status,source,"
             "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,project_id "
             "FROM codebook_categories_old_v19"
         )
@@ -769,7 +778,6 @@ def _migrate_categories_goal_unique(conn: DBAdapter) -> None:
             CREATE TABLE categories (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 name            TEXT NOT NULL,
-                igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
                 parent_id       INTEGER REFERENCES categories(id),
                 description     TEXT NOT NULL DEFAULT '',
                 examples        TEXT NOT NULL DEFAULT '[]',
@@ -791,10 +799,10 @@ def _migrate_categories_goal_unique(conn: DBAdapter) -> None:
         )
         conn.execute(
             "INSERT INTO categories "
-            "(id,name,igio_axis,parent_id,description,examples,status,source,"
+            "(id,name,parent_id,description,examples,status,source,"
             "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,"
             "project_id,goal_id) "
-            "SELECT id,name,igio_axis,parent_id,description,examples,status,source,"
+            "SELECT id,name,parent_id,description,examples,status,source,"
             "evidence_count,embedding_id,risk_level,languages,patterns,promoted_at,"
             "project_id,goal_id FROM categories_old_v22"
         )
@@ -995,7 +1003,6 @@ def _init_schema(conn: DBAdapter) -> None:
         CREATE TABLE IF NOT EXISTS categories (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             name            TEXT NOT NULL,
-            igio_axis       TEXT CHECK (igio_axis IN ('I','G','V','O') OR igio_axis IS NULL),
             parent_id       INTEGER REFERENCES categories(id),
             description     TEXT NOT NULL DEFAULT '',
             examples        TEXT NOT NULL DEFAULT '[]',
@@ -1585,21 +1592,13 @@ def insert_chunk(
              start_offset, end_offset, text, text_hash, summary, category_labels,
              category_version, embedding_model, embedding_id, quality_score,
              dedup_key, category_source, category_confidence,
-             igio_axis, igio_confidence, igio_classified_at,
              created_at, superseded_by, is_active, workspace_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chunk_id) DO UPDATE SET
             text=excluded.text, text_hash=excluded.text_hash,
             summary=excluded.summary, category_labels=excluded.category_labels,
             category_source=excluded.category_source,
             category_confidence=excluded.category_confidence,
-            -- WHY(write-leak): persist the IGIO axis on insert (was dropped from
-            -- the column list entirely), but on re-ingest NEVER clobber a
-            -- classified axis with an unclassified ('') re-insert — only a real
-            -- incoming axis updates it. Preserves the IGIO-cron's work.
-            igio_axis = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_axis ELSE igio_axis END,
-            igio_confidence = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_confidence ELSE igio_confidence END,
-            igio_classified_at = CASE WHEN excluded.igio_axis != '' THEN excluded.igio_classified_at ELSE igio_classified_at END,
             is_active=1, superseded_by=NULL, created_at=excluded.created_at,
             workspace_id=excluded.workspace_id
         """,
@@ -1610,7 +1609,6 @@ def insert_chunk(
             chunk.category_version, chunk.embedding_model, chunk.embedding_id,
             chunk.quality_score, chunk.dedup_key,
             chunk.category_source, chunk.category_confidence,
-            chunk.igio_axis, chunk.igio_confidence, chunk.igio_classified_at,
             chunk.created_at, chunk.superseded_by, int(chunk.is_active), _ws,
         ),
     )
@@ -1795,40 +1793,6 @@ def update_chunk_category_labels(
             updated += 1
     _maybe_commit(conn)
     return updated
-
-
-def update_chunk_igio_axis(
-    conn: Any,
-    chunk_id: str,
-    axis: str,
-    confidence: float = 0.85,
-) -> bool:
-    """Tag a single chunk with an IGIO axis without touching other fields.
-
-    WHY(igio-pipeline-2026-05-15): stop_hook sends a fast-hint axis from the
-    user prompt (regex, no LLM). Writing it here skips the async IGIO cron
-    and makes the axis immediately visible in /memory/goals and retrieval
-    scoring. Only overwrites when the existing axis is empty so the LLM-cron
-    verdict (higher confidence) is never clobbered.
-    """
-    import datetime as _dt
-    row = conn.execute(
-        "SELECT igio_axis FROM chunks WHERE chunk_id = ? AND is_active = 1",
-        (chunk_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    existing = (row[0] or "").strip()
-    if existing:  # already classified by LLM-cron → don't overwrite
-        return False
-    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE chunks SET igio_axis = ?, igio_confidence = ?, igio_classified_at = ? "
-        "WHERE chunk_id = ?",
-        (axis, confidence, now, chunk_id),
-    )
-    _maybe_commit(conn)
-    return True
 
 
 def log_context_injection(

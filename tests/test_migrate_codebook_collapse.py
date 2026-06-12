@@ -41,7 +41,6 @@ def _old_schema_db(path: Path) -> sqlite3.Connection:
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             codebook_id     INTEGER NOT NULL REFERENCES codebooks(id) ON DELETE CASCADE,
             name            TEXT NOT NULL,
-            igio_axis       TEXT,
             parent_id       INTEGER REFERENCES codebook_categories(id),
             description     TEXT NOT NULL DEFAULT '',
             examples        TEXT NOT NULL DEFAULT '[]',

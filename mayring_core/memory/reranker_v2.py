@@ -35,21 +35,18 @@ _log = logging.getLogger(__name__)
 
 # Memory-Injection v3 features (Issue #180):
 #   * `v, s, r, a`: retrieval stages (vector, symbolic, recency, source-aff)
-#   * `igio_<axis>`: one-hot of issue/goal/intervention/outcome/unknown
 #
 # Removed vs v2 setup:
 #   * `f` (linear-combo of v,s,r,a — multikollin)
 #   * `sf` (target leakage: derived from same chunk_feedback table as label)
 #   * `sl` (~70% rows have sl=0.5 default — almost constant)
 #
-# score_v2() reads these from stage_scores at runtime; chunks without
-# an IGIO axis match igio_unknown=1, all other igio_*=0. Backward
-# compatible with old v2 model files (weights for missing features are
-# treated as 0 so a 6-feature model still scores).
-_IGIO_AXES = ("issue", "goal", "intervention", "outcome", "unknown")
+# score_v2() reads these from stage_scores at runtime. Backward compatible
+# with old model files (weights for missing features are treated as 0, so a
+# model trained with extra/legacy features still scores).
 # cat_match (#270 reranker-v3): strukturierter category_id-Abgleich Query↔Kandidat.
 # Geloggt + vom täglichen Trainer gewichtet; backward-compat (fehlt im Modell → w=0).
-_FEATURES = ("v", "s", "r", "a") + tuple(f"igio_{a}" for a in _IGIO_AXES) + ("cat_match",)
+_FEATURES = ("v", "s", "r", "a", "cat_match")
 _LOCK = threading.Lock()
 # Per-version cache: version → (model_dict_or_None, mtime). Keyed by version so
 # v2/v3/v4 can be loaded independently (reranker-version-table 2026-05-30).

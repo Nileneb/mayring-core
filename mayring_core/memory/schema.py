@@ -150,9 +150,6 @@ class Chunk:
     dedup_key: str = ""           # sha256 of normalized text (for near-dedup)
     category_source: str = ""     # "deductive"|"inductive"|"hybrid"|"fallback"|"manual"|""
     category_confidence: float = 0.0
-    igio_axis: str = ""           # "" | "issue" | "goal" | "intervention" | "outcome"
-    igio_confidence: float = 0.0
-    igio_classified_at: str = ""
     created_at: str = field(default_factory=lambda: _now_iso())
     workspace_id: str = "default"
     superseded_by: str | None = None
@@ -187,9 +184,6 @@ class Chunk:
             "dedup_key": self.dedup_key,
             "category_source": self.category_source,
             "category_confidence": self.category_confidence,
-            "igio_axis": self.igio_axis,
-            "igio_confidence": self.igio_confidence,
-            "igio_classified_at": self.igio_classified_at,
             "created_at": self.created_at,
             "superseded_by": self.superseded_by,
             "is_active": self.is_active,

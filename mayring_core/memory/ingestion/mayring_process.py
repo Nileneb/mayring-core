@@ -50,7 +50,6 @@ class ProcessResult:
     category_name: str | None
     decision: str  # deductive | hybrid | inductive | inductive-dedup
     confidence: float
-    igio_axis: str | None
     proposed: bool
 
 
@@ -147,13 +146,13 @@ def _load_categories(conn: Any, statuses: tuple[str, ...],
     else:
         scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
-        "SELECT id, name, igio_axis, parent_id, embedding_id, status, evidence_count "
+        "SELECT id, name, parent_id, embedding_id, status, evidence_count "
         f"FROM categories WHERE status IN ({placeholders}) "
         f"{scope} ORDER BY id",
         (*statuses, *extra),
     ).fetchall()
-    return [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
-             "embedding_id": r[4], "status": r[5], "evidence_count": r[6]} for r in rows]
+    return [{"id": r[0], "name": r[1], "parent_id": r[2],
+             "embedding_id": r[3], "status": r[4], "evidence_count": r[5]} for r in rows]
 
 
 def _category_embeddings(chroma: Any, cats: list[dict]) -> list[tuple[dict, list[float]]]:
@@ -227,21 +226,6 @@ def derive_labels_from_categories(
     return out
 
 
-def _infer_igio_axis(name: str) -> str | None:
-    """Best-effort IGIO axis from the label until the importer backfills it
-    (Phase 1 gap: igio_axis is NULL for all imported categories)."""
-    low = name.lower()
-    if any(k in low for k in ("ergebnis", "result", "finding", "outcome")):
-        return "O"
-    if any(k in low for k in ("limitation", "issue", "problem", "risk", "input")):
-        return "I"
-    if any(k in low for k in ("goal", "ziel", "objective", "aim")):
-        return "G"
-    if any(k in low for k in ("vorgehen", "method", "process", "approach")):
-        return "V"
-    return None
-
-
 def _clean_label(raw: str) -> str:
     """Säubert die LLM-Antwort zu EINEM Kategorie-Label. Wenn das Modell statt eines bloßen
     snake_case-Labels JSON geleakt hat (Objekt/Array — passiert ohne JSON-Mode bzw. wenn der
@@ -303,10 +287,10 @@ def link_chunks_deductive(
     else:
         scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
-        "SELECT id, name, igio_axis, parent_id, embedding_id FROM categories "
+        "SELECT id, name, parent_id, embedding_id FROM categories "
         f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
-    cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
-             "embedding_id": r[4]} for r in rows]
+    cats = [{"id": r[0], "name": r[1], "parent_id": r[2],
+             "embedding_id": r[3]} for r in rows]
     pairs = _category_embeddings(chroma_categories, cats)
     if not pairs:
         return 0
@@ -346,10 +330,10 @@ def _active_category_pairs(conn: Any, chroma_categories: Any,
     else:
         scope, extra = "AND project_id IS NULL", ()
     rows = conn.execute(
-        "SELECT id, name, igio_axis, parent_id, embedding_id FROM categories "
+        "SELECT id, name, parent_id, embedding_id FROM categories "
         f"WHERE status='active' AND embedding_id != '' {scope} ORDER BY id", extra).fetchall()
-    cats = [{"id": r[0], "name": r[1], "igio_axis": r[2], "parent_id": r[3],
-             "embedding_id": r[4]} for r in rows]
+    cats = [{"id": r[0], "name": r[1], "parent_id": r[2],
+             "embedding_id": r[3]} for r in rows]
     pairs = _category_embeddings(chroma_categories, cats)
     # WHY(2026-05-28): do NOT negative-cache an empty result. The chroma
     # codebook_categories collection is empty right after a deploy cutover and
@@ -496,7 +480,7 @@ def _assign_or_create(
             _link_chunk(conn, chunk_id, top_cat["id"], version=codebook_version,
                         confidence=score, source="deductive")
         return ProcessResult(top_cat["id"], top_cat["name"], "deductive",
-                             round(score, 4), top_cat.get("igio_axis"), proposed=False)
+                             round(score, 4), proposed=False)
 
     # 5 induktiv: keine vorhandene passt. Erst HART dedupen (active ODER proposed), sonst
     # entsteht ein zweites Fragment derselben Kategorie.
@@ -509,18 +493,17 @@ def _assign_or_create(
         promoted = _maybe_promote(conn, dedup_cat["id"], dedup_cat.get("status", "proposed"),
                                   new_count, promote_threshold)
         return ProcessResult(dedup_cat["id"], dedup_cat["name"], "inductive-dedup",
-                             round(dedup_score, 4), dedup_cat.get("igio_axis"),
+                             round(dedup_score, 4),
                              proposed=(dedup_cat.get("status") != "active" and not promoted))
 
     # echte Neu-Kategorie (ziel-gebunden gebildet) als 'proposed'; Embedding hinterlegen,
     # damit sie ab Promotion für cat_match matchbar ist + Folge-Runden dedupen.
     from src.api.routes.codebooks import record_proposal  # late: web import cycle
     parent_hint_id = top_cat["id"] if top_cat is not None else None
-    igio = _infer_igio_axis(candidate_label)
     # WHY(v19-drop-codebook): record_proposal-Signatur OHNE codebook_id (Controller passt
     # die Definition in MayringCoder/src/api/routes/codebooks.py an).
     cat_id = record_proposal(conn, candidate_label, paraphrase=task[:200],
-                             parent_hint_id=parent_hint_id, igio_axis=igio,
+                             parent_hint_id=parent_hint_id,
                              pi_job_id=pi_job_id, chunk_id=chunk_id, project_id=project_id)
     emb_id = f"cb:proposed:{cat_id}"
     if chroma_categories is not None and candidate_emb:
@@ -532,13 +515,13 @@ def _assign_or_create(
         _link_chunk(conn, chunk_id, cat_id, version=codebook_version,
                     confidence=score, source="inductive")
     promoted = _maybe_promote(conn, cat_id, "proposed", 1, promote_threshold)  # frisch=evidence 1
-    new_cat = {"id": cat_id, "name": candidate_label, "igio_axis": igio,
+    new_cat = {"id": cat_id, "name": candidate_label,
                "parent_id": parent_hint_id, "embedding_id": emb_id,
                "status": "active" if promoted else "proposed", "evidence_count": 1}
     dedup_pairs.append((new_cat, candidate_emb))          # intra-batch Dedup
     if promoted:
         active_pairs.append((new_cat, candidate_emb))     # ab jetzt auch deduktiv matchbar
-    return ProcessResult(cat_id, candidate_label, "inductive", round(score, 4), igio,
+    return ProcessResult(cat_id, candidate_label, "inductive", round(score, 4),
                          proposed=not promoted)
 
 

@@ -249,7 +249,7 @@ def ingest(
     # to its closest active codebook category (deductive, LLM-free) → fills
     # chunk_categories for the reranker. Scope = shared base ∪ this project's own.
     link_project_id = effective.get("project_id") or None
-    # Category linking is ALWAYS on — it feeds reranker cat_match / IGIO / wiki /
+    # Category linking is ALWAYS on — it feeds reranker cat_match / wiki /
     # display and is cheap (deterministic deductive, no LLM). There is no valid
     # reason to ingest a chunk without linking it, so the old `link_categories`
     # opt-out flag was removed (it was dead config — no caller ever set it False).
@@ -491,8 +491,8 @@ def ingest(
                       category_links, len(chunks_to_categorize), source.source_id,
                       link_project_id, goal[:60])
             # Free-string category_labels FK-abgeleitet (eine SoT). insert_chunk schrieb sie
-            # leer; die ~10 Konsumenten (IGIO-Classifier, wiki-edges, recap, Such-Anzeige,
-            # paper_rules) laufen unverändert weiter — gleiche Spalte, FK-Quelle.
+            # leer; die Konsumenten (wiki-edges, Such-Anzeige, paper_rules) laufen
+            # unverändert weiter — gleiche Spalte, FK-Quelle.
             from mayring_core.memory.ingestion.mayring_process import derive_labels_from_categories
             label_map = derive_labels_from_categories(conn, new_chunk_ids)
             for cid, labels in label_map.items():

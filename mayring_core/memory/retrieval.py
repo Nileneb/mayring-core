@@ -278,82 +278,6 @@ def _normalize_vector_scores(
 
 
 # ---------------------------------------------------------------------------
-# IGIO-intent detection — outcome/issue/goal/intervention boost
-# ---------------------------------------------------------------------------
-
-# WHY(2026-05-10 IGIO-utilisation): outcome ist die wichtigste axis für
-# "was kam dabei raus / wirkung / konsequenz"-fragen, wurde aber im v1-
-# rerank ignoriert. Dieser intent-detector ist KEYWORD-basiert (kein LLM)
-# damit jede search-call ihn aufrufen kann ohne extra-latenz. Treffer-
-# patterns kalibriert auf DE+EN, da user häufig deutsch fragt.
-_IGIO_INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
-    "outcome": (
-        # de
-        "ergebnis", "ergebnisse", "konsequenz", "konsequenzen", "wirkung",
-        "auswirkung", "auswirkungen", "resultat", "resultate", "was kam dabei raus",
-        "was kam raus", "was passierte", "was hat sich geändert", "fazit",
-        "outcome", "outcomes",
-        # en
-        "result", "results", "consequence", "consequences", "effect", "effects",
-        "what happened", "what changed", "impact",
-    ),
-    "issue": (
-        # de
-        "problem", "probleme", "bug", "fehler", "issue", "warum", "wieso",
-        "weshalb", "ursache", "ursachen",
-        # en
-        "issues", "bugs", "error", "errors", "why does", "why is",
-        "root cause", "broken",
-    ),
-    "goal": (
-        # de
-        "ziel", "ziele", "vorhaben", "soll", "möchte", "möchten", "plan",
-        "planung", "intention",
-        # en
-        "goal", "goals", "objective", "objectives", "target", "we want",
-        "intend", "intent", "plan to",
-    ),
-    "intervention": (
-        # de
-        "wie umsetzen", "wie implementieren", "wie löse", "wie löst",
-        "wie fixe", "wie repariere", "wie baue", "schritte", "anleitung",
-        "how to fix", "how to implement",
-        # en
-        "implementation", "implement", "how do i", "how can i", "fix it",
-        "steps", "approach",
-    ),
-}
-
-
-def detect_igio_intent(query: str) -> str | None:
-    """Erkenne welche IGIO-axis die query primär anspricht.
-
-    Returns "outcome" | "issue" | "goal" | "intervention" oder None wenn
-    kein klares signal. Bei mehrfach-treffern wins die axis mit der
-    höchsten match-zahl. Bei gleichstand wins outcome > issue > goal >
-    intervention (ranking nach informationsgehalt — outcome ist am
-    spezifischsten).
-    """
-    if not query:
-        return None
-    q = query.lower()
-    counts: dict[str, int] = {}
-    for axis, patterns in _IGIO_INTENT_PATTERNS.items():
-        n = sum(1 for p in patterns if p in q)
-        if n > 0:
-            counts[axis] = n
-    if not counts:
-        return None
-    # Wins-priority bei tie: outcome > issue > goal > intervention
-    priority = ("outcome", "issue", "goal", "intervention")
-    max_count = max(counts.values())
-    for axis in priority:
-        if counts.get(axis, 0) == max_count:
-            return axis
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Stage 3b: Optional LLM pre-filter
 # ---------------------------------------------------------------------------
 
@@ -524,7 +448,6 @@ def _rerank(
     reranker_override: str | None = None,
     predicted_topics: set[str] | None = None,
     category_hint: list[str] | None = None,
-    igio_intent: str | None = None,
     task_id: str | None = None,
     query_category_ids: set[int] | None = None,
     session_chunk_ids: set[str] | None = None,
@@ -605,17 +528,6 @@ def _rerank(
         c.lower() for c in (category_hint or []) if c
     }
 
-    # WHY(2026-05-10 IGIO-intent-boost): wir klassifizieren chunks auf
-    # issue/goal/intervention/outcome-axis (igio_classifier.py), nutzen die
-    # axis aber im aktiven v1-rerank GAR NICHT (nur disabled v2 hat sie
-    # als one-hot-feature). Konsequenz: wenn user nach "konsequenzen",
-    # "ergebnissen", "was kam dabei raus" fragt, werden outcome-chunks
-    # NICHT priorisiert — outcome ist die wichtigste axis für
-    # nach-fakten-fragen, geht aber im scoring unter. Fix: chunks die zu
-    # der detected intent-axis matchen kriegen +0.10 boost.
-    _IGIO_INTENT_BOOST = 0.10
-    igio_intent_axis = (igio_intent or "").lower().strip()
-
     # Reranker-v3 (#270): strukturierter category_id-Match. Die category_hint-Strings
     # → category_ids auflösen, dann gegen die chunk_categories-FKs der Kandidaten
     # matchen. Kleiner deterministischer Boost im v1-Pfad (sofort + sicher, kein
@@ -691,13 +603,6 @@ def _rerank(
             if cat_hint_set & chunk_cats:
                 sc = 1.0
 
-        # IGIO-intent boost: 1.0 wenn chunk.igio_axis zur intent passt.
-        # Beispiel: query="was kam dabei raus" → intent="outcome",
-        # chunk mit igio_axis="outcome" bekommt +0.10.
-        si = 0.0
-        if igio_intent_axis and (chunk.igio_axis or "").lower() == igio_intent_axis:
-            si = 1.0
-
         # Reranker-v3 structured category_id match (s. Setup oben).
         scat_id = _category_id_match(query_cat_ids, chunk_cat_map.get(chunk.chunk_id, set()))
 
@@ -732,7 +637,6 @@ def _rerank(
             + _WEIGHTS["llm_advisor"] * sl
             + _PRED_BOOST * sp
             + _CAT_HINT_BOOST * sc
-            + _IGIO_INTENT_BOOST * si
             + _CAT_MATCH_BOOST * scat_id
             + _PROJECT_MATCH_BOOST * sproj
             + convergence_bonus
@@ -751,17 +655,13 @@ def _rerank(
                 score_v1 = min(1.0, score_v1 + 0.10)
 
         if rr_version == "v2" and rr_model is not None:
-            # v3-Feature-Set: retrieval stages + IGIO one-hot. sf/sl
-            # raus wegen Target-Leakage (siehe Issue #180). Für
-            # Backward-Compat zu älteren v2-Modellfiles bleibt das
-            # weights-dict 'forgiving' — fehlende keys → weight=0 in
+            # v3-Feature-Set: retrieval stages. sf/sl raus wegen Target-Leakage
+            # (siehe Issue #180). Für Backward-Compat zu älteren v2-Modellfiles
+            # bleibt das weights-dict 'forgiving' — fehlende keys → weight=0 in
             # score_v2.
-            axis = (chunk.igio_axis or "unknown").lower()
             stage = {"v": sv_eff, "s": ss, "r": sr, "a": sa,
                      # legacy keys für alte rerank_v2.json
                      "sf": sf, "sl": sl}
-            for a_label in ("issue", "goal", "intervention", "outcome", "unknown"):
-                stage[f"igio_{a_label}"] = 1.0 if axis == a_label else 0.0
             stage["cat_match"] = scat_id   # reranker-v3 (#270)
             # pt (predicted_topic) IST ein gelerntes Feature (train_reranker.FEATURES,
             # loader-gated >=0). Es war geloggt+trainiert, aber nie in den stage-Dict am
@@ -1207,10 +1107,6 @@ def search(
     rr_version, _ = _get_active(query_hint=query,
                                 explicit_override=opts.get("reranker_version"))
     opts["_reranker_used"] = rr_version  # bubbled into diagnostics
-    # IGIO-intent: query nach outcome/issue/goal/intervention scannen.
-    # Override per opts["igio_intent"] möglich (z.B. explicit aus UI).
-    igio_intent = opts.get("igio_intent") or detect_igio_intent(query)
-    opts["_igio_intent"] = igio_intent  # für diagnostics
 
     # Reranker-v3 (#270): derive the QUERY's categories from its embedding so
     # cat_match fires for EVERY search, not only when the caller passes category_hint
@@ -1241,7 +1137,6 @@ def search(
         reranker_override=opts.get("reranker_version"),
         predicted_topics=predicted_topics,
         category_hint=opts.get("category_hint"),
-        igio_intent=igio_intent,
         task_id=opts.get("task_id"),
         query_category_ids=query_category_ids,
         session_chunk_ids=set(session_ids) if session_ids else None,

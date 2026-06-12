@@ -37,7 +37,6 @@ def test_legacy_db_upgrade_adds_goal_id_and_goals(tmp_path):
         CREATE TABLE categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            igio_axis TEXT,
             parent_id INTEGER REFERENCES categories(id),
             description TEXT NOT NULL DEFAULT '',
             examples TEXT NOT NULL DEFAULT '[]',
@@ -126,7 +125,6 @@ def test_v21_to_v22_rebuild_preserves_data_and_fks(tmp_path):
         CREATE TABLE categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            igio_axis TEXT,
             parent_id INTEGER REFERENCES categories(id),
             description TEXT NOT NULL DEFAULT '',
             examples TEXT NOT NULL DEFAULT '[]',

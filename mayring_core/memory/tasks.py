@@ -73,7 +73,7 @@ def create_task(
     if not is_valid_scope_key(scope_key):
         raise ValueError(f"invalid scope_key: {scope_key!r}")
 
-    # WHY(igio-todos): idempotent capture — a re-fired PostToolUse hook for the
+    # WHY(task-capture): idempotent capture — a re-fired PostToolUse hook for the
     # same harness task must update the existing row, not create a duplicate.
     if external_id:
         existing = conn.execute(
@@ -197,45 +197,5 @@ def delete_task(conn: DBAdapter, workspace_id: str, task_id: str) -> bool:
     )
     conn.commit()
     return conn.changes() > 0
-
-
-_GOAL_SOURCE_TYPES = (
-    "conversation_summary", "note", "session_knowledge", "session",
-    "task", "user_context", "knowledge",
-)
-
-
-def list_workspace_goals(
-    conn: DBAdapter,
-    workspace_id: str,
-    *,
-    limit: int = 100,
-) -> list[dict]:
-    """Return IGIO-goal chunks from user-owned source types (not paper/ambient)."""
-    placeholders = ",".join("?" * len(_GOAL_SOURCE_TYPES))
-    rows = conn.execute(
-        f"""
-        SELECT c.chunk_id, c.summary, c.text, c.created_at
-        FROM chunks c
-        JOIN sources s ON c.source_id = s.source_id
-        WHERE c.igio_axis = 'goal'
-          AND c.is_active = 1
-          AND s.workspace_id = ?
-          AND s.source_type IN ({placeholders})
-        ORDER BY c.created_at DESC
-        LIMIT ?
-        """,
-        (workspace_id, *_GOAL_SOURCE_TYPES, limit),
-    ).fetchall()
-    return [
-        {
-            "chunk_id": r["chunk_id"],
-            "title": (r["summary"] or r["text"] or "")[:120],
-            "source": "goal",
-            "read_only": True,
-            "created_at": r["created_at"],
-        }
-        for r in rows
-    ]
 
 

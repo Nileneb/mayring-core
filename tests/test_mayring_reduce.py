@@ -101,7 +101,7 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypat
     )
 
     def _fake_record_proposal(conn, candidate_label, *, paraphrase="",
-                              parent_hint_id=None, igio_axis=None, pi_job_id="",
+                              parent_hint_id=None, pi_job_id="",
                               chunk_id=None, project_id=None):
         conn.execute(
             "INSERT OR IGNORE INTO categories(name, status, source, evidence_count) "
