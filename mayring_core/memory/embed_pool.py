@@ -33,7 +33,7 @@ def ensure_tables(conn: Any) -> None:
             text         TEXT NOT NULL,
             chunk_ref    TEXT NOT NULL DEFAULT '',
             model        TEXT NOT NULL DEFAULT 'bge-m3',
-            is_golden    INTEGER NOT NULL DEFAULT 0,
+            is_golden    INTEGER NOT NULL DEFAULT 0,  -- is_golden/golden_ref: golden test-jobs, populated in Task 4 (collusion-breaker)
             golden_ref   TEXT NOT NULL DEFAULT '',
             status       TEXT NOT NULL DEFAULT 'queued',
             device_a     TEXT NOT NULL DEFAULT '',
@@ -53,10 +53,8 @@ def ensure_tables(conn: Any) -> None:
 
 
 def _row_to_dict(row: Any) -> dict:
-    keys = ("embed_id", "workspace_id", "projekt_id", "text", "chunk_ref", "model",
-            "is_golden", "golden_ref", "status", "device_a", "result_a", "device_b",
-            "result_b", "cosine", "verdict", "created_at", "verified_at")
-    return {k: row[k] for k in keys}
+    """All columns as a plain dict — drift-free as the DDL grows (sqlite3.Row → dict)."""
+    return dict(row)
 
 
 def enqueue(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
