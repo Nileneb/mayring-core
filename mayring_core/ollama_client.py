@@ -190,6 +190,15 @@ def generate(
     the field, let Ollama decide). Callers can force it (True/False) per call
     — e.g. image captioning with stream=False might opt out explicitly.
     """
+    # WHY(Spec B1): the text-route generate (Advisor/categorize/search/pi_run, all
+    # imageless) is what loads qwen3.5-mayring:2b into VRAM. Stamp every such call so
+    # GET /stats/gpu-idle can tell app.linn.games whether the local Gemma research
+    # batch may run — protects the Memory-Hook hot-path from Gemma VRAM eviction.
+    # Vision (images=...) and embeddings (separate endpoints) are NOT stamped.
+    if not images:
+        from mayring_core.qwen_activity import stamp as _stamp_qwen
+        _stamp_qwen()
+
     base = url.rstrip("/")
     body: dict[str, Any] = {"model": model, "prompt": prompt, "stream": stream}
     if think is not None:
