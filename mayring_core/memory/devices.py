@@ -233,6 +233,7 @@ def record_embed_verified(conn: Any, device_id: str, workspace_id: str = "defaul
 def record_embed_divergence(conn: Any, device_id: str, workspace_id: str = "default") -> None:
     """One divergence: +1 divergence, -2.0 trust (divergence costs more than agreement earns)."""
     ensure_tables(conn)
+    # WHY(#365): 2:1 asymmetry — one bad embed needs two agreements to recover, so a noisy device drops out of eligibility instead of lingering.
     conn.execute(
         "UPDATE devices SET embed_divergences = embed_divergences + 1, "
         "trust_score = trust_score - 2.0 "
@@ -243,8 +244,12 @@ def record_embed_divergence(conn: Any, device_id: str, workspace_id: str = "defa
 
 
 def set_quarantine(conn: Any, device_id: str, workspace_id: str, *, until: str) -> None:
-    """Set (or clear, until='') the quarantine deadline (ISO-8601 string compare)."""
+    """Set (or clear, until='') the quarantine deadline. WHY(#365): normalise to the
+    Z-suffix _now_iso() format on write so the lexicographic ISO compare in
+    eligible_embed_devices is sound regardless of the caller's input format."""
     ensure_tables(conn)
+    if until:
+        until = datetime.fromisoformat(until.replace("Z", "+00:00")).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn.execute(
         "UPDATE devices SET quarantined_until = ? WHERE device_id = ? AND workspace_id = ?",
         (until, device_id, workspace_id),
@@ -257,8 +262,6 @@ def eligible_embed_devices(conn: Any, workspace_id: str, *, now: str, fresh_seco
     heartbeat fresher than fresh_seconds, and not currently quarantined (now >= until,
     or until empty). Quarantine gate uses lexicographic ISO compare; freshness parses
     last_seen vs now."""
-    from datetime import datetime
-
     def _parse(ts: str):
         if not ts:
             return None
@@ -281,9 +284,10 @@ def eligible_embed_devices(conn: Any, workspace_id: str, *, now: str, fresh_seco
         if quar and now < quar:
             continue
         ls = _parse(last_seen)
-        if now_dt is not None and ls is not None:
-            if (now_dt - ls).total_seconds() > fresh_seconds:
-                continue
+        if ls is None:  # WHY(#365): unknown/empty heartbeat = exclude (fail-closed, not fail-open)
+            continue
+        if now_dt is not None and (now_dt - ls).total_seconds() > fresh_seconds:
+            continue
         out.append(did)
     return out
 
