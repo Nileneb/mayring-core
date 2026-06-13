@@ -6,10 +6,13 @@ devices' is a single UPDATE guard (device_a != claimer)."""
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any
+
+from mayring_core.embed_verify import cosine, verify
 
 VALID_STATUS = ("queued", "claimed_one", "claimed_two", "verified", "diverged", "failed")
 
@@ -112,4 +115,94 @@ def claim_replica(conn: Any, *, device_id: str, workspace_id: str) -> dict | Non
     return None
 
 
-__all__ = ("VALID_STATUS", "ensure_tables", "enqueue", "get", "claim_replica")
+def submit_result(conn: Any, *, embed_id: str, device_id: str,
+                  vector: list[float], threshold: float) -> dict:
+    """Store this device's vector into its slot. When both slots are filled, compare
+    by cosine: agreement → status 'verified' + agreed_vector (slot A as reference);
+    divergence → status 'diverged'. Returns a verdict dict the caller acts on
+    (canonical write on agreement; quarantine on divergence)."""
+    ensure_tables(conn)
+    row = conn.execute("SELECT * FROM embed_jobs WHERE embed_id = ?", (embed_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown embed_id {embed_id!r}")
+    payload = json.dumps(vector)
+    if row["device_a"] == device_id:
+        conn.execute("UPDATE embed_jobs SET result_a=? WHERE embed_id=?", (payload, embed_id))
+    elif row["device_b"] == device_id:
+        conn.execute("UPDATE embed_jobs SET result_b=? WHERE embed_id=?", (payload, embed_id))
+    else:
+        raise ValueError(f"device {device_id!r} holds no slot on {embed_id!r}")
+    conn.commit()
+    row = conn.execute("SELECT * FROM embed_jobs WHERE embed_id = ?", (embed_id,)).fetchone()
+    if not (row["result_a"] and row["result_b"]):
+        return {"status": row["status"], "verdict": ""}
+    va, vb = json.loads(row["result_a"]), json.loads(row["result_b"])
+    sim = cosine(va, vb)
+    now = _now_iso()
+    devices = [row["device_a"], row["device_b"]]
+    if verify(va, vb, threshold=threshold):
+        conn.execute(
+            "UPDATE embed_jobs SET status='verified', verdict='agreement', "
+            "cosine=?, verified_at=? WHERE embed_id=?", (sim, now, embed_id))
+        conn.commit()
+        return {"status": "verified", "verdict": "agreement", "agreed_vector": va,
+                "cosine": sim, "devices": devices, "chunk_ref": row["chunk_ref"],
+                "projekt_id": row["projekt_id"]}
+    conn.execute(
+        "UPDATE embed_jobs SET status='diverged', verdict='divergence', "
+        "cosine=?, verified_at=? WHERE embed_id=?", (sim, now, embed_id))
+    conn.commit()
+    return {"status": "diverged", "verdict": "divergence", "cosine": sim, "devices": devices}
+
+
+def enqueue_golden(conn: Any, *, workspace_id: str, text: str,
+                   reference: list[float], model: str = "bge-m3") -> str:
+    ensure_tables(conn)
+    eid = _new_id()
+    conn.execute(
+        "INSERT INTO embed_jobs (embed_id, workspace_id, text, model, is_golden, "
+        "golden_ref, status, created_at) VALUES (?, ?, ?, ?, 1, ?, 'queued', ?)",
+        (eid, workspace_id, text, model, json.dumps(reference), _now_iso()),
+    )
+    conn.commit()
+    return eid
+
+
+def claim_golden(conn: Any, *, device_id: str, workspace_id: str) -> dict | None:
+    """Assign the oldest queued golden job to this (typically quarantined) device."""
+    ensure_tables(conn)
+    row = conn.execute(
+        "UPDATE embed_jobs SET status='claimed_one', device_a=? "
+        "WHERE embed_id=(SELECT embed_id FROM embed_jobs WHERE workspace_id=? "
+        "AND is_golden=1 AND status='queued' ORDER BY created_at LIMIT 1) "
+        "AND status='queued' RETURNING *",
+        (device_id, workspace_id),
+    ).fetchone()
+    conn.commit()
+    return _row_to_dict(row) if row else None
+
+
+def submit_golden(conn: Any, *, embed_id: str, device_id: str,
+                  vector: list[float], threshold: float) -> dict:
+    """Compare a golden result to its stored reference. passed=True rehabilitates."""
+    ensure_tables(conn)
+    row = conn.execute("SELECT * FROM embed_jobs WHERE embed_id = ?", (embed_id,)).fetchone()
+    if row is None or not row["is_golden"]:
+        raise ValueError(f"{embed_id!r} is not a golden job")
+    ref = json.loads(row["golden_ref"])
+    sim = cosine(vector, ref)
+    passed = verify(vector, ref, threshold=threshold)
+    conn.execute(
+        "UPDATE embed_jobs SET result_a=?, status=?, verdict=?, cosine=?, verified_at=? "
+        "WHERE embed_id=?",
+        (json.dumps(vector), "verified" if passed else "failed",
+         "golden_pass" if passed else "golden_fail", sim, _now_iso(), embed_id),
+    )
+    conn.commit()
+    return {"passed": passed, "cosine": sim, "device_id": device_id}
+
+
+__all__ = (
+    "VALID_STATUS", "ensure_tables", "enqueue", "get", "claim_replica",
+    "submit_result", "enqueue_golden", "claim_golden", "submit_golden",
+)
