@@ -232,6 +232,30 @@ def submit_golden(conn: Any, *, embed_id: str, device_id: str,
     return {"passed": passed, "cosine": sim, "device_id": device_id}
 
 
+def should_audit(conn: Any, device_id: str, workspace_id: str, *, warmup: int, sample_rate: int) -> bool:
+    """Trust-based sampling: unknown / quarantined / below-warmup devices are ALWAYS audited;
+    trusted devices are audited 1-in-`sample_rate` (deterministic via the embed_verified counter,
+    NOT random). WHY(#365): keeps new/bad devices tight while letting proven devices scale past
+    the single auditor."""
+    row = conn.execute(
+        "SELECT embed_verified, quarantined_until FROM devices WHERE device_id=? AND workspace_id=?",
+        (device_id, workspace_id)).fetchone()
+    if row is None:
+        return True
+    verified = row[0]
+    quar = row[1]
+    if quar:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if now < quar:
+            return True
+    if verified < warmup:
+        return True
+    if sample_rate <= 1:
+        return True
+    return (verified % sample_rate) == 0
+
+
 def list_diverged_audits(conn: Any, workspace_id: str, *, limit: int = 100) -> list[dict]:
     """Diverged audit rows awaiting the app-side clawback reaper."""
     ensure_tables(conn)
@@ -251,5 +275,5 @@ def reap_audit(conn: Any, embed_id: str) -> None:
 __all__ = (
     "VALID_STATUS", "ensure_tables", "enqueue", "enqueue_with_seed", "get",
     "claim_replica", "submit_result", "enqueue_golden", "claim_golden", "submit_golden",
-    "list_diverged_audits", "reap_audit",
+    "list_diverged_audits", "reap_audit", "should_audit",
 )
