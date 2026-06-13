@@ -160,7 +160,8 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
         "UPDATE embed_jobs SET status='diverged', verdict='divergence', "
         "cosine=?, verified_at=? WHERE embed_id=?", (sim, now, embed_id))
     conn.commit()
-    return {"status": "diverged", "verdict": "divergence", "cosine": sim, "devices": devices}
+    return {"status": "diverged", "verdict": "divergence", "cosine": sim,
+            "devices": devices, "is_audit": bool(row["is_audit"])}
 
 
 def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
