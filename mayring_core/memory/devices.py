@@ -62,6 +62,10 @@ def ensure_tables(conn: Any) -> None:
             last_seen    TEXT NOT NULL DEFAULT '',
             status       TEXT NOT NULL DEFAULT 'active',
             created_at   TEXT NOT NULL DEFAULT '',
+            trust_score       REAL NOT NULL DEFAULT 0,
+            embed_verified    INTEGER NOT NULL DEFAULT 0,
+            embed_divergences INTEGER NOT NULL DEFAULT 0,
+            quarantined_until TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (device_id, workspace_id)
         );
         CREATE INDEX IF NOT EXISTS idx_devices_workspace
@@ -142,7 +146,8 @@ def list_devices(conn: Any, workspace_id: str) -> list[dict]:
     # device_capabilities/effective_capabilities, NICHT hier (read-only Admin-View).
     _cols = (
         "SELECT device_id, workspace_id, name, os, capabilities, "
-        "last_seen, status, created_at FROM devices"
+        "last_seen, status, created_at, trust_score, embed_verified, "
+        "embed_divergences, quarantined_until FROM devices"
     )
     if workspace_id == "system":
         rows = conn.execute(_cols + " ORDER BY last_seen DESC").fetchall()
@@ -161,6 +166,10 @@ def list_devices(conn: Any, workspace_id: str) -> list[dict]:
             "last_seen": r[5],
             "status": r[6],
             "created_at": r[7],
+            "trust_score": r[8],
+            "embed_verified": r[9],
+            "embed_divergences": r[10],
+            "quarantined_until": r[11],
         }
         for r in rows
     ]
@@ -203,6 +212,84 @@ def effective_capabilities(
     if registered is not None:
         return registered
     return [c for c in (self_reported or []) if c != WRITE_CAPABILITY]
+
+
+# ---------------------------------------------------------------------------
+# Embed pool: trust / quarantine / eligibility (#365 Schicht 3)
+# ---------------------------------------------------------------------------
+
+def record_embed_verified(conn: Any, device_id: str, workspace_id: str = "default") -> None:
+    """One agreement: +1 verified, +1.0 trust."""
+    ensure_tables(conn)
+    conn.execute(
+        "UPDATE devices SET embed_verified = embed_verified + 1, "
+        "trust_score = trust_score + 1.0 "
+        "WHERE device_id = ? AND workspace_id = ?",
+        (device_id, workspace_id),
+    )
+    conn.commit()
+
+
+def record_embed_divergence(conn: Any, device_id: str, workspace_id: str = "default") -> None:
+    """One divergence: +1 divergence, -2.0 trust (divergence costs more than agreement earns)."""
+    ensure_tables(conn)
+    conn.execute(
+        "UPDATE devices SET embed_divergences = embed_divergences + 1, "
+        "trust_score = trust_score - 2.0 "
+        "WHERE device_id = ? AND workspace_id = ?",
+        (device_id, workspace_id),
+    )
+    conn.commit()
+
+
+def set_quarantine(conn: Any, device_id: str, workspace_id: str, *, until: str) -> None:
+    """Set (or clear, until='') the quarantine deadline (ISO-8601 string compare)."""
+    ensure_tables(conn)
+    conn.execute(
+        "UPDATE devices SET quarantined_until = ? WHERE device_id = ? AND workspace_id = ?",
+        (until, device_id, workspace_id),
+    )
+    conn.commit()
+
+
+def eligible_embed_devices(conn: Any, workspace_id: str, *, now: str, fresh_seconds: int) -> list[str]:
+    """device_ids eligible to claim embed jobs: registered with 'embed' capability,
+    heartbeat fresher than fresh_seconds, and not currently quarantined (now >= until,
+    or until empty). Quarantine gate uses lexicographic ISO compare; freshness parses
+    last_seen vs now."""
+    from datetime import datetime
+
+    def _parse(ts: str):
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    ensure_tables(conn)
+    now_dt = _parse(now)
+    rows = conn.execute(
+        "SELECT device_id, capabilities, last_seen, quarantined_until "
+        "FROM devices WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall()
+    out: list[str] = []
+    for did, caps, last_seen, quar in rows:
+        if "embed" not in _split_caps(caps):
+            continue
+        if quar and now < quar:
+            continue
+        ls = _parse(last_seen)
+        if now_dt is not None and ls is not None:
+            if (now_dt - ls).total_seconds() > fresh_seconds:
+                continue
+        out.append(did)
+    return out
+
+
+def is_eligible_embed(conn: Any, device_id: str, workspace_id: str, *, now: str, fresh_seconds: int) -> bool:
+    return device_id in eligible_embed_devices(conn, workspace_id, now=now, fresh_seconds=fresh_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +365,11 @@ __all__ = (
     "list_devices",
     "device_capabilities",
     "effective_capabilities",
+    "record_embed_verified",
+    "record_embed_divergence",
+    "set_quarantine",
+    "eligible_embed_devices",
+    "is_eligible_embed",
     "record_hook_event",
     "list_hook_events",
 )

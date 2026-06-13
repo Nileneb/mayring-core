@@ -185,7 +185,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 25  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12)
+CURRENT_SCHEMA_VERSION = 26  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12); v26: embed-pool device cols (#365)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -858,6 +858,26 @@ def _migrate_devices_composite_pk(conn: DBAdapter) -> None:
     conn.commit()
 
 
+def _migrate_devices_embed_pool_cols(conn: DBAdapter) -> None:
+    """Add embed-pool columns to an existing `devices` table — migration v25→v26.
+    Idempotent: ADD COLUMN can't be IF NOT EXISTS in SQLite, so gate on PRAGMA table_info."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "devices" not in tables:
+        return
+    have = {r[1] for r in conn.execute("PRAGMA table_info(devices)").fetchall()}
+    adds = {
+        "trust_score": "REAL NOT NULL DEFAULT 0",
+        "embed_verified": "INTEGER NOT NULL DEFAULT 0",
+        "embed_divergences": "INTEGER NOT NULL DEFAULT 0",
+        "quarantined_until": "TEXT NOT NULL DEFAULT ''",
+    }
+    for col, decl in adds.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE devices ADD COLUMN {col} {decl}")
+    conn.commit()
+
+
 def _init_schema(conn: DBAdapter) -> None:
     """Ensure all tables and indexes exist, with schema versioning to skip DDL when current.
 
@@ -1320,6 +1340,10 @@ def _init_schema(conn: DBAdapter) -> None:
             last_seen    TEXT NOT NULL DEFAULT '',
             status       TEXT NOT NULL DEFAULT 'active',
             created_at   TEXT NOT NULL DEFAULT '',
+            trust_score       REAL NOT NULL DEFAULT 0,
+            embed_verified    INTEGER NOT NULL DEFAULT 0,
+            embed_divergences INTEGER NOT NULL DEFAULT 0,
+            quarantined_until TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (device_id, workspace_id)
         );
         CREATE INDEX IF NOT EXISTS idx_devices_workspace ON devices(workspace_id);
@@ -1373,6 +1397,10 @@ def _init_schema(conn: DBAdapter) -> None:
 
     # Migration v5→v6: devices PK device_id → (device_id, workspace_id) (#274 review)
     _migrate_devices_composite_pk(conn)
+
+    # Migration v25→v26: embed-pool trust/quarantine cols (#365). MUSS nach dem
+    # composite-PK-Rebuild laufen — der rebuildet devices ohne diese Spalten.
+    _migrate_devices_embed_pool_cols(conn)
 
     # v22: categories UNIQUE(name) → UNIQUE(goal_id, name). MUSS nach _migrate_schema
     # (goal_id-ALTER) laufen.
