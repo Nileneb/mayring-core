@@ -133,6 +133,7 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
     else:
         raise ValueError(f"device {device_id!r} holds no slot on {embed_id!r}")
     conn.commit()
+    # WHY(#365): re-read both slots after the slot write — the slot UPDATE has no RETURNING (A/B branch), so re-SELECT is the clean way to read both results atomically (sqlite serialises writes).
     row = conn.execute("SELECT * FROM embed_jobs WHERE embed_id = ?", (embed_id,)).fetchone()
     if not (row["result_a"] and row["result_b"]):
         return {"status": row["status"], "verdict": ""}
@@ -157,6 +158,7 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
 
 def enqueue_golden(conn: Any, *, workspace_id: str, text: str,
                    reference: list[float], model: str = "bge-m3") -> str:
+    """Enqueue a golden test-job: a known sample whose embedding is compared against a stored reference vector — the collusion-breaker for quarantined devices."""
     ensure_tables(conn)
     eid = _new_id()
     conn.execute(
