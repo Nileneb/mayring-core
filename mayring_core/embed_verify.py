@@ -11,8 +11,8 @@ import math
 
 
 def cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity. Returns 0.0 on length mismatch or a zero vector
-    (treated as divergence by verify(), never a crash)."""
+    """Cosine similarity. Returns 0.0 for degenerate inputs (length mismatch or
+    a zero vector) instead of raising — verify() reads that as below any threshold."""
     if len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
