@@ -156,6 +156,27 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
     return {"status": "diverged", "verdict": "divergence", "cosine": sim, "devices": devices}
 
 
+def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
+                      chunk_ref: str, device_a: str, vector_a: list[float],
+                      model: str = "bge-m3") -> str:
+    """Enqueue an embed job with slot A PRE-FILLED by a submitter's own vector
+    (#365 player-embed verification). The row starts at status='claimed_one' with
+    device_a/result_a set, so a SECOND distinct device claims slot B and the
+    existing cosine verify confirms or refutes the submitted vector. The seeding
+    device cannot also claim slot B (claim_replica's device_a != claimer guard)."""
+    ensure_tables(conn)
+    eid = _new_id()
+    conn.execute(
+        "INSERT INTO embed_jobs (embed_id, workspace_id, projekt_id, text, chunk_ref, "
+        "model, status, device_a, result_a, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'claimed_one', ?, ?, ?)",
+        (eid, workspace_id, projekt_id, text, chunk_ref, model, device_a,
+         json.dumps(vector_a), _now_iso()),
+    )
+    conn.commit()
+    return eid
+
+
 def enqueue_golden(conn: Any, *, workspace_id: str, text: str,
                    reference: list[float], model: str = "bge-m3") -> str:
     """Enqueue a golden test-job: a known sample whose embedding is compared against a stored reference vector — the collusion-breaker for quarantined devices."""
@@ -205,6 +226,6 @@ def submit_golden(conn: Any, *, embed_id: str, device_id: str,
 
 
 __all__ = (
-    "VALID_STATUS", "ensure_tables", "enqueue", "get", "claim_replica",
-    "submit_result", "enqueue_golden", "claim_golden", "submit_golden",
+    "VALID_STATUS", "ensure_tables", "enqueue", "enqueue_with_seed", "get",
+    "claim_replica", "submit_result", "enqueue_golden", "claim_golden", "submit_golden",
 )
