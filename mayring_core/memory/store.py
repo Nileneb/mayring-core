@@ -185,7 +185,7 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 26  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12); v26: embed-pool device cols (#365)
+CURRENT_SCHEMA_VERSION = 27  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12); v26: embed-pool device cols (#365); v27: embed_jobs.is_audit (#365 house-audit)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -878,6 +878,17 @@ def _migrate_devices_embed_pool_cols(conn: DBAdapter) -> None:
     conn.commit()
 
 
+def _migrate_embed_jobs_audit_col(conn: DBAdapter) -> None:
+    """Add embed_jobs.is_audit — migration v26->v27. Idempotent (PRAGMA table_info gate)."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "embed_jobs" not in tables:
+        return
+    have = {r[1] for r in conn.execute("PRAGMA table_info(embed_jobs)").fetchall()}
+    if "is_audit" not in have:
+        conn.execute("ALTER TABLE embed_jobs ADD COLUMN is_audit INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
 def _init_schema(conn: DBAdapter) -> None:
     """Ensure all tables and indexes exist, with schema versioning to skip DDL when current.
 
@@ -1376,6 +1387,7 @@ def _init_schema(conn: DBAdapter) -> None:
             model        TEXT NOT NULL DEFAULT 'bge-m3',
             is_golden    INTEGER NOT NULL DEFAULT 0,
             golden_ref   TEXT NOT NULL DEFAULT '',
+            is_audit     INTEGER NOT NULL DEFAULT 0,
             status       TEXT NOT NULL DEFAULT 'queued',
             device_a     TEXT NOT NULL DEFAULT '',
             result_a     TEXT NOT NULL DEFAULT '',
@@ -1428,6 +1440,9 @@ def _init_schema(conn: DBAdapter) -> None:
     # Migration v25→v26: embed-pool trust/quarantine cols (#365). MUSS nach dem
     # composite-PK-Rebuild laufen — der rebuildet devices ohne diese Spalten.
     _migrate_devices_embed_pool_cols(conn)
+
+    # Migration v26→v27: embed_jobs.is_audit (#365 house-audit).
+    _migrate_embed_jobs_audit_col(conn)
 
     # v22: categories UNIQUE(name) → UNIQUE(goal_id, name). MUSS nach _migrate_schema
     # (goal_id-ALTER) laufen.

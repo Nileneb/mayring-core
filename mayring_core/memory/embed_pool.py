@@ -38,6 +38,7 @@ def ensure_tables(conn: Any) -> None:
             model        TEXT NOT NULL DEFAULT 'bge-m3',
             is_golden    INTEGER NOT NULL DEFAULT 0,  -- is_golden/golden_ref: golden test-jobs, populated in Task 4 (collusion-breaker)
             golden_ref   TEXT NOT NULL DEFAULT '',
+            is_audit     INTEGER NOT NULL DEFAULT 0,
             status       TEXT NOT NULL DEFAULT 'queued',
             device_a     TEXT NOT NULL DEFAULT '',
             result_a     TEXT NOT NULL DEFAULT '',
@@ -158,7 +159,7 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
 
 def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
                       chunk_ref: str, device_a: str, vector_a: list[float],
-                      model: str = "bge-m3") -> str:
+                      model: str = "bge-m3", is_audit: bool = False) -> str:
     """Enqueue an embed job with slot A PRE-FILLED by a submitter's own vector
     (#365 player-embed verification). The row starts at status='claimed_one' with
     device_a/result_a set, so a SECOND distinct device claims slot B and the
@@ -168,10 +169,10 @@ def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: st
     eid = _new_id()
     conn.execute(
         "INSERT INTO embed_jobs (embed_id, workspace_id, projekt_id, text, chunk_ref, "
-        "model, status, device_a, result_a, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'claimed_one', ?, ?, ?)",
+        "model, status, device_a, result_a, is_audit, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'claimed_one', ?, ?, ?, ?)",
         (eid, workspace_id, projekt_id, text, chunk_ref, model, device_a,
-         json.dumps(vector_a), _now_iso()),
+         json.dumps(vector_a), 1 if is_audit else 0, _now_iso()),
     )
     conn.commit()
     return eid
