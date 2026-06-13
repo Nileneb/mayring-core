@@ -143,6 +143,12 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
     now = _now_iso()
     devices = [row["device_a"], row["device_b"]]
     if verify(va, vb, threshold=threshold):
+        if row["is_audit"]:
+            conn.execute("DELETE FROM embed_jobs WHERE embed_id=?", (embed_id,))
+            conn.commit()
+            return {"status": "verified", "verdict": "agreement", "agreed_vector": va,
+                    "cosine": sim, "devices": devices, "chunk_ref": row["chunk_ref"],
+                    "projekt_id": row["projekt_id"], "audit_passed": True}
         conn.execute(
             "UPDATE embed_jobs SET status='verified', verdict='agreement', "
             "cosine=?, verified_at=? WHERE embed_id=?", (sim, now, embed_id))
@@ -226,7 +232,24 @@ def submit_golden(conn: Any, *, embed_id: str, device_id: str,
     return {"passed": passed, "cosine": sim, "device_id": device_id}
 
 
+def list_diverged_audits(conn: Any, workspace_id: str, *, limit: int = 100) -> list[dict]:
+    """Diverged audit rows awaiting the app-side clawback reaper."""
+    ensure_tables(conn)
+    rows = conn.execute(
+        "SELECT * FROM embed_jobs WHERE workspace_id=? AND is_audit=1 AND status='diverged' "
+        "ORDER BY created_at LIMIT ?", (workspace_id, limit)).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def reap_audit(conn: Any, embed_id: str) -> None:
+    """Delete an audit row after the app side applied its clawback (idempotent)."""
+    ensure_tables(conn)
+    conn.execute("DELETE FROM embed_jobs WHERE embed_id=? AND is_audit=1", (embed_id,))
+    conn.commit()
+
+
 __all__ = (
     "VALID_STATUS", "ensure_tables", "enqueue", "enqueue_with_seed", "get",
     "claim_replica", "submit_result", "enqueue_golden", "claim_golden", "submit_golden",
+    "list_diverged_audits", "reap_audit",
 )
