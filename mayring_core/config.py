@@ -141,3 +141,15 @@ def set_batch_delay(seconds: float) -> None:
 
 def get_batch_delay() -> float:
     return _active_batch_delay
+
+
+# --- Distributed embedding pool (#365 Schicht 3) -----------------------------
+# WHY(#365): single source of all pool balancing knobs; env-overridable so no
+# code change is needed to retune. verify_threshold tolerates bge-m3 FP noise
+# across GPUs; trust_min_devices gates trust-based sampling (below = always 2x).
+EMBED_VERIFY_THRESHOLD = float(os.getenv("MAYRING_EMBED_VERIFY_THRESHOLD", "0.9999"))
+EMBED_REPLICATION = int(os.getenv("MAYRING_EMBED_REPLICATION", "2"))
+EMBED_TRUST_MIN_DEVICES = int(os.getenv("MAYRING_EMBED_TRUST_MIN_DEVICES", "20"))
+EMBED_QUARANTINE_SECONDS = int(os.getenv("MAYRING_EMBED_QUARANTINE_SECONDS", "3600"))
+EMBED_HEARTBEAT_FRESH_SECONDS = int(os.getenv("MAYRING_EMBED_HEARTBEAT_FRESH_SECONDS", "120"))
+EMBED_DUAL_CLAIM_TIMEOUT_SECONDS = int(os.getenv("MAYRING_EMBED_DUAL_CLAIM_TIMEOUT_SECONDS", "300"))
