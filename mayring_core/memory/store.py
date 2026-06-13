@@ -1362,6 +1362,33 @@ def _init_schema(conn: DBAdapter) -> None:
         CREATE INDEX IF NOT EXISTS idx_hook_events_ws_fired
             ON hook_events(workspace_id, fired_at);
 
+        -- #365 Schicht 3: Distributed embedding pool. One row per embed task with
+        -- two claim slots (A/B); two DISTINCT devices each fill a slot and the
+        -- vectors get cross-checked. Canonical schema; the lazy ensure_tables in
+        -- embed_pool.py mirrors this (raw-conn tests + safety net for v26 DBs that
+        -- predate this table, since _init_schema early-returns at user_version>=26).
+        CREATE TABLE IF NOT EXISTS embed_jobs (
+            embed_id     TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            projekt_id   TEXT NOT NULL DEFAULT '',
+            text         TEXT NOT NULL,
+            chunk_ref    TEXT NOT NULL DEFAULT '',
+            model        TEXT NOT NULL DEFAULT 'bge-m3',
+            is_golden    INTEGER NOT NULL DEFAULT 0,
+            golden_ref   TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'queued',
+            device_a     TEXT NOT NULL DEFAULT '',
+            result_a     TEXT NOT NULL DEFAULT '',
+            device_b     TEXT NOT NULL DEFAULT '',
+            result_b     TEXT NOT NULL DEFAULT '',
+            cosine       REAL,
+            verdict      TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL DEFAULT '',
+            verified_at  TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_embed_jobs_ws_status
+            ON embed_jobs(workspace_id, status, created_at);
+
         -- notification_state (v23): Seen/Ack-Status je hook_event für das
         -- Ampel-Notification-Center. DRY: hook_events bleibt Source-of-Truth
         -- (Klassifikation + repo/project-Zuordnung deterministisch on-read), hier
