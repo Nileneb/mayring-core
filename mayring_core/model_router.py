@@ -31,6 +31,37 @@ _DEFAULTS: dict[str, dict] = {
     "embedding": {"model": "nomic-embed-text",    "fallback": "nomic-embed-text", "timeout": 60},
 }
 
+# Zentrale Modell-Konfig (app.linn.games /api/mcp/model-config) — Single-Source-of-
+# Truth für alle MCP-Server. Opt-in per MAYRING_MODEL_CONFIG_URL; ohne env null
+# Verhaltensänderung (Fallback auf text_model.txt → model_routes.yaml). Fail-soft.
+_CENTRAL_CACHE: dict[str, tuple[dict, float]] = {}
+_CENTRAL_TTL = 60.0
+
+
+def _fetch_central_config(server: str) -> dict:
+    """{task: {model, options}} vom zentralen Endpoint, 60s gecached. {} bei
+    fehlendem env/Fehler — der Consumer fällt dann transparent auf seine lokale
+    Auflösung zurück (text_model.txt → yaml). Niemals blockieren."""
+    base = os.getenv("MAYRING_MODEL_CONFIG_URL", "").rstrip("/")
+    if not base or _httpx is None:
+        return {}
+    now = time.monotonic()
+    cached = _CENTRAL_CACHE.get(server)
+    if cached is not None and now - cached[1] < _CENTRAL_TTL:
+        return cached[0]
+    token = os.getenv("MCP_SERVICE_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        resp = _httpx.get(
+            f"{base}/api/mcp/model-config",
+            params={"server": server}, headers=headers, timeout=3.0,
+        )
+        cfg = (resp.json() or {}).get("config", {}) or {} if resp.status_code == 200 else {}
+    except Exception:
+        cfg = {}
+    _CENTRAL_CACHE[server] = (cfg, now)
+    return cfg
+
 
 @dataclass
 class RouteConfig:
@@ -62,6 +93,8 @@ class ModelRouter:
 
     def __init__(self, ollama_url: str = "http://localhost:11434") -> None:
         self._ollama_url = ollama_url.rstrip("/")
+        # Name dieses Consumers im zentralen Config-Schema (server-Spalte).
+        self._central_server = os.getenv("MAYRING_MODEL_CONFIG_SERVER", "mayringcoder")
         self._routes: dict[str, RouteConfig] = {
             task: RouteConfig(**cfg) for task, cfg in _DEFAULTS.items()
         }
@@ -146,13 +179,17 @@ class ModelRouter:
     def resolve(self, task: str, job_class: str | None = None) -> str:
         """Return model name for task, optional job_class override.
 
-        Priority: text_model.txt → config/model_routes.yaml::classes[job_class]
-        → outer route → hardcoded default → "". Unknown job_class silently
-        falls back to outer (no error — opaque per spec #183).
+        Priority: zentrale Config (app.linn.games) → text_model.txt →
+        config/model_routes.yaml::classes[job_class] → outer route → hardcoded
+        default → "". Unknown job_class silently falls back to outer (no error —
+        opaque per spec #183).
 
-        Never reads OLLAMA_MODEL env — change models via Web-UI or
+        Never reads OLLAMA_MODEL env — change models via zentrale UI, Web-UI oder
         model_routes.yaml.
         """
+        central = _fetch_central_config(self._central_server).get(task) or {}
+        if central.get("model"):
+            return str(central["model"])
         if task == "text":
             override = self._read_text_override()
             if override:
@@ -177,6 +214,12 @@ class ModelRouter:
         if job_class and cfg.classes and job_class in cfg.classes:
             return cfg.classes[job_class].timeout
         return cfg.timeout
+
+    def options_for(self, task: str) -> dict:
+        """Zentrale Generate-Optionen für task ({think, num_ctx, …}), leer wenn
+        keine zentrale Config. Caller reichen das an ollama_client.generate durch —
+        so wird z.B. think=False für categorize zentral steuerbar."""
+        return _fetch_central_config(self._central_server).get(task, {}).get("options") or {}
 
     def resolve_with_fallback(self, task: str) -> str:
         """Return model name, falling back to fallback if primary not available."""
