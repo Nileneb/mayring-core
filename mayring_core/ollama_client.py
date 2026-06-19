@@ -74,6 +74,13 @@ _CLOUD_MODEL_MAP_DEFAULT = {
     "qwen2.5-coder": "qwen3-coder-next",
     "qwen3.5:2b": "ministral-3:3b",
     "qwen3:2b": "ministral-3:3b",
+    # The local 'text' route is the fine-tune qwen3.5-mayring:2b, which does NOT
+    # exist on ollama.com → map it (and its family prefix) to the small cloud
+    # general-purpose model so cloud-primary calls don't fall back to the larger
+    # default. ministral-3:3b is the smallest available cloud model (~4.7GB) →
+    # highest request throughput, which is what we want for the 50% cloud split.
+    "qwen3.5-mayring:2b": "ministral-3:3b",
+    "qwen3.5-mayring": "ministral-3:3b",
     "phi3:3.8b": "ministral-3:3b",
 }
 
@@ -93,9 +100,10 @@ def _parse_cloud_map() -> dict[str, str]:
 
 
 _CLOUD_MODEL_MAP = _parse_cloud_map()
-# Default cloud-modell wenn local-name nicht in map — gemma3:4b ist klein,
-# schnell und für 90% der pi-task-prompts ausreichend.
-_CLOUD_DEFAULT_MODEL = os.getenv("OLLAMA_CLOUD_DEFAULT_MODEL", "gemma3:4b")
+# Default cloud-modell wenn local-name nicht in map — ministral-3:3b ist das
+# kleinste verfügbare cloud-modell (~4.7GB), schnell (~0.7s) und maximiert den
+# durchsatz beim 50%-cloud-split. Override per OLLAMA_CLOUD_DEFAULT_MODEL.
+_CLOUD_DEFAULT_MODEL = os.getenv("OLLAMA_CLOUD_DEFAULT_MODEL", "ministral-3:3b")
 
 
 def _resolve_cloud_model(local_model: str) -> str:
