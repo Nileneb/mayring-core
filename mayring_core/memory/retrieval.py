@@ -233,12 +233,41 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
+# WHY(2026-06-20 hook-latency): re-tokenising the full text+summary of EVERY
+# candidate on EVERY search dominated /memory/search latency (~3s for a 10k
+# candidate set). With a single-user prod workspace where ~all chunks are that
+# user's `private` memory, _scope_filter returns the whole workspace as
+# candidates, so symbolic scoring re-tokenised 10k full texts per query → 5s+
+# searches that blew the 9s/12s UserPromptSubmit hook budget and silently
+# killed memory injection. The token set is query-INDEPENDENT, so memoise it per
+# chunk_id and invalidate on text_hash change. Pure perf — identical scores.
+_CHUNK_TOKENS: dict[str, tuple[str, frozenset[str]]] = {}
+_CHUNK_TOKENS_CAP = 100_000
+
+
+def _chunk_token_set(chunk: Chunk) -> frozenset[str]:
+    """Memoised lowercase token set over chunk.text + chunk.summary."""
+    text_hash = chunk.text_hash or ""
+    if text_hash:
+        cached = _CHUNK_TOKENS.get(chunk.chunk_id)
+        if cached is not None and cached[0] == text_hash:
+            return cached[1]
+    tokens = frozenset(_tokenize(chunk.text) | _tokenize(chunk.summary))
+    if text_hash:
+        # text_hash present → safe to cache+invalidate. Without it (legacy rows)
+        # recompute every time rather than risk serving stale tokens.
+        if len(_CHUNK_TOKENS) >= _CHUNK_TOKENS_CAP:
+            _CHUNK_TOKENS.clear()
+        _CHUNK_TOKENS[chunk.chunk_id] = (text_hash, tokens)
+    return tokens
+
+
 def _symbolic_score(chunk: Chunk, query_terms: set[str]) -> float:
     """0.0–1.0 score based on token overlap + path/category bonuses."""
     if not query_terms:
         return 0.0
 
-    chunk_terms = _tokenize(chunk.text) | _tokenize(chunk.summary)
+    chunk_terms = _chunk_token_set(chunk)
     overlap = len(query_terms & chunk_terms) / len(query_terms)
 
     # Bonus: query term appears in source path (file relevance)
