@@ -218,7 +218,10 @@ def delete_reranker_version(version: str) -> bool:
     version = (version or "").strip().lower()
     if version in ("v1", "auto") or not _VERSION_RE.match(version):
         raise ValueError(f"nicht löschbar: {version!r} (nur trainierte v<N>-Modelle)")
-    if _read_runtime_default() == version:
+    # WHY(2026-06-20 SoT): gegen die echte Serving-SoT (read_active_versions = ALLE
+    # aktiven A/B-Seiten) prüfen, nicht das legacy single-default — sonst ist die
+    # zweite A/B-Version löschbar und rerank_active.json zeigt ins Leere.
+    if version in read_active_versions():
         raise ValueError(f"{version!r} ist aktiv — erst eine andere Version aktivieren")
     p = _model_path(version)
     if not p.exists():
@@ -278,6 +281,11 @@ def write_active_versions(versions: list[str]) -> list[str]:
     p = _active_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(versions), encoding="utf-8")
+    # WHY(2026-06-20 SoT-Divergenz): rerank_default.txt (legacy single-default) speist
+    # den delete-guard + den read_active_versions-Migrations-Fallback. Lief es nicht
+    # synchron mit, zeigte es auf ein anderes Modell als das serving-aktive (Bug:
+    # default=v4 während aktiv=v3). Primär-aktive Version mitschreiben → EINE Wahrheit.
+    write_runtime_default(versions[0])  # versions[0] schon oben als existent/v1 validiert
     invalidate_v2_cache()
     return versions
 
