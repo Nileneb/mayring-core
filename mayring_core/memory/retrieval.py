@@ -341,7 +341,7 @@ def _llm_relevance_scores(
     query: str,
     candidates: list[Chunk],
     ollama_url: str,
-    model: str = "mistral:7b-instruct",
+    model: str | None = None,
     timeout: float = _ADVISOR_TIMEOUT,
     task_context: str | None = None,
 ) -> dict[str, float]:
@@ -363,11 +363,16 @@ def _llm_relevance_scores(
     hook had no inject-state to rate → zero auto-feedback. One batched,
     kept-warm call rates all candidates in ~0.5s warm; max_retries=1 + a tight
     timeout degrade to the cheap ranking instead of re-blowing the budget on
-    the (2,5,10s) retry ladder. Default model mistral:7b-instruct is
-    non-thinking (no </think> trap) and is already the Stop-hook judge model,
-    so a single resident model serves both.
+    the (2,5,10s) retry ladder. The text-task model (resolved via ModelRouter,
+    no code literal) should be non-thinking (no </think> trap) and is typically
+    the same resident model as the Stop-hook judge.
     """
     from mayring_core.ollama_client import generate as _oll_gen
+    if not model:  # resolve the text model from the single source — never a literal
+        from mayring_core.model_router import ModelRouter
+        model = ModelRouter(ollama_url).resolve("text")
+    if not model:
+        return {}  # no text model configured → degrade to the cheap ranking (best-effort)
     cands = [c for c in candidates[:_ADVISOR_BATCH_MAX] if (c.text or "").strip()]
     if not cands:
         return {}
@@ -1036,9 +1041,10 @@ def search(
         # single SQLite write lock under sustained pi-claim/ingest load, blocking this
         # read-mostly search for 8-14s. Telemetry must never sit on the hot path.
         from mayring_core.memory.store import log_llm_call_async
+        from mayring_core.config import EMBEDDING_MODEL as _EMBED_MODEL
         log_llm_call_async(
             call_type="vector_search",
-            model=_os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
+            model=_EMBED_MODEL,
             prompt=query[:200],
             response=_json.dumps({"vector_stage": vector_diag}),
             tool_calls=0,
@@ -1088,7 +1094,7 @@ def search(
                 from mayring_core.model_router import ModelRouter
                 llm_model = ModelRouter(ollama_url).resolve("text")
             except Exception:
-                llm_model = "mistral:7b-instruct"
+                llm_model = ""  # _llm_relevance_scores re-resolves / degrades — no literal
         llm_scores = _llm_relevance_scores(
             query, pre, ollama_url,
             model=llm_model,

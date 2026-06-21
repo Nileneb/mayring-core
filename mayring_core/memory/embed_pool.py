@@ -35,7 +35,7 @@ def ensure_tables(conn: Any) -> None:
             projekt_id   TEXT NOT NULL DEFAULT '',
             text         TEXT NOT NULL,
             chunk_ref    TEXT NOT NULL DEFAULT '',
-            model        TEXT NOT NULL DEFAULT 'bge-m3',
+            model        TEXT NOT NULL DEFAULT '',
             is_golden    INTEGER NOT NULL DEFAULT 0,  -- is_golden/golden_ref: golden test-jobs, populated in Task 4 (collusion-breaker)
             golden_ref   TEXT NOT NULL DEFAULT '',
             is_audit     INTEGER NOT NULL DEFAULT 0,
@@ -62,7 +62,10 @@ def _row_to_dict(row: Any) -> dict:
 
 
 def enqueue(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
-            chunk_ref: str, model: str = "bge-m3") -> str:
+            chunk_ref: str, model: str | None = None) -> str:
+    if model is None:  # resolve the embedder from the single source, never a literal
+        from mayring_core.config import EMBEDDING_MODEL
+        model = EMBEDDING_MODEL
     ensure_tables(conn)
     eid = _new_id()
     conn.execute(
@@ -166,12 +169,15 @@ def submit_result(conn: Any, *, embed_id: str, device_id: str,
 
 def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: str,
                       chunk_ref: str, device_a: str, vector_a: list[float],
-                      model: str = "bge-m3", is_audit: bool = False) -> str:
+                      model: str | None = None, is_audit: bool = False) -> str:
     """Enqueue an embed job with slot A PRE-FILLED by a submitter's own vector
     (#365 player-embed verification). The row starts at status='claimed_one' with
     device_a/result_a set, so a SECOND distinct device claims slot B and the
     existing cosine verify confirms or refutes the submitted vector. The seeding
     device cannot also claim slot B (claim_replica's device_a != claimer guard)."""
+    if model is None:  # single source, never a literal
+        from mayring_core.config import EMBEDDING_MODEL
+        model = EMBEDDING_MODEL
     ensure_tables(conn)
     eid = _new_id()
     conn.execute(
@@ -186,8 +192,11 @@ def enqueue_with_seed(conn: Any, *, workspace_id: str, projekt_id: str, text: st
 
 
 def enqueue_golden(conn: Any, *, workspace_id: str, text: str,
-                   reference: list[float], model: str = "bge-m3") -> str:
+                   reference: list[float], model: str | None = None) -> str:
     """Enqueue a golden test-job: a known sample whose embedding is compared against a stored reference vector — the collusion-breaker for quarantined devices."""
+    if model is None:  # single source, never a literal
+        from mayring_core.config import EMBEDDING_MODEL
+        model = EMBEDDING_MODEL
     ensure_tables(conn)
     eid = _new_id()
     conn.execute(

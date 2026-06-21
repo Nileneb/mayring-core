@@ -68,7 +68,40 @@ MAX_CONTEXT_CHARS = 6000  # ~500 tokens
 
 # RAG context (Phase 2: ChromaDB similarity search)
 RAG_TOP_K = 5                          # Number of similar context entries to inject
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")  # Ollama embedding model; env-switch to bge-m3 (multilingual) in prod
+_EMBED_MODEL_CACHE: str | None = None
+
+
+def _central_embedding_model() -> str:
+    """Resolve the embedding model from the SINGLE source of truth — NEVER a code
+    literal. Precedence: EMBEDDING_MODEL env (set centrally via GH-vars) → the
+    ModelRouter ('embedding' task in config/model_routes.yaml / central config).
+    Fails LOUD if nothing is configured: a missing model config is a deploy error,
+    not something to silently paper over with a stale hardcoded default — that exact
+    pattern (a leftover nomic literal) loaded a 2nd embedder into VRAM for a week.
+    Change models in ONE place (the yaml / GH-var); no code edit, ever."""
+    env = os.getenv("EMBEDDING_MODEL")
+    if env:
+        return env
+    from mayring_core.model_router import ModelRouter
+    model = ModelRouter().resolve("embedding")
+    if not model:
+        raise RuntimeError(
+            "No embedding model configured. Set the 'embedding' task in "
+            "config/model_routes.yaml (or the EMBEDDING_MODEL env / central "
+            "model-config). There is NO hardcoded code default by design.")
+    return model
+
+
+def __getattr__(name: str):
+    # Lazy + cached: importing config never resolves a model (the library stays
+    # importable without a config present), and hot paths that do
+    # `from config import EMBEDDING_MODEL` don't re-construct the router each call.
+    if name == "EMBEDDING_MODEL":
+        global _EMBED_MODEL_CACHE
+        if _EMBED_MODEL_CACHE is None:
+            _EMBED_MODEL_CACHE = _central_embedding_model()
+        return _EMBED_MODEL_CACHE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Ollama
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))
