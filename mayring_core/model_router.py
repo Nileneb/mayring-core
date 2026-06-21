@@ -28,7 +28,9 @@ _CONFIG_PATH = _ROOT / "config" / "model_routes.yaml"
 _DEFAULTS: dict[str, dict] = {
     "text":      {"model": "mistral:7b-instruct", "fallback": "qwen2.5-coder:7b", "timeout": 240},
     "vision":    {"model": "qwen2.5vl:3b",        "fallback": "",                 "timeout": 120},
-    "embedding": {"model": "nomic-embed-text",    "fallback": "nomic-embed-text", "timeout": 60},
+    # bge-m3 (1024d) is the store's actual embedder. Was nomic-embed-text (768d) —
+    # a dead default that loaded a 2nd embedder into VRAM after the bge-m3 cutover.
+    "embedding": {"model": "bge-m3",              "fallback": "bge-m3",           "timeout": 60},
 }
 
 # Zentrale Modell-Konfig (app.linn.games /api/mcp/model-config) — Single-Source-of-

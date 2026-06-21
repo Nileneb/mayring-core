@@ -144,7 +144,7 @@ class Chunk:
     summary: str = ""
     category_labels: list[str] = field(default_factory=list)
     category_version: str = "mayring-inductive-v1"
-    embedding_model: str = "nomic-embed-text"
+    embedding_model: str = field(default_factory=lambda: _default_embed_model())
     embedding_id: str = ""
     quality_score: float = 0.0
     dedup_key: str = ""           # sha256 of normalized text (for near-dedup)
@@ -312,3 +312,11 @@ class RetrievalRecord:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _default_embed_model() -> str:
+    """Record the embedder a chunk was made with from the single source of truth
+    (config.EMBEDDING_MODEL), never a nomic literal. Lazy import avoids an import
+    cycle (config ← model_router ← config)."""
+    from mayring_core.config import EMBEDDING_MODEL
+    return EMBEDDING_MODEL

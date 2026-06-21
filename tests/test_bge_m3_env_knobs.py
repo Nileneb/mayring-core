@@ -1,6 +1,7 @@
 """bge-m3 migration: env-driven embedding model, blue-green collection name,
-and the model-specific task-dedup threshold. All must default to the prior
-nomic behaviour (backward compat) and only change when the env var is set."""
+and the model-specific task-dedup threshold. The embedding model resolves from
+the central model_routes.yaml (last-resort bge-m3, never nomic); the collection
+name + dedup threshold keep their prior defaults unless the env var is set."""
 import importlib
 
 from mayring_core.memory import store
@@ -40,9 +41,12 @@ def test_embedding_model_env_driven(monkeypatch):
     importlib.reload(config)
     assert config.EMBEDDING_MODEL == "bge-m3"
 
+    # No env → resolve from the central model_routes.yaml ('embedding' task),
+    # last-resort bge-m3. NEVER nomic — the store moved off nomic(768d) long ago
+    # and a stray nomic default loaded a 2nd embedder into VRAM (week-old bug).
     monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
     importlib.reload(config)
-    assert config.EMBEDDING_MODEL == "nomic-embed-text"
+    assert config.EMBEDDING_MODEL == "bge-m3"
 
 
 def test_task_sim_threshold_env_driven(monkeypatch):

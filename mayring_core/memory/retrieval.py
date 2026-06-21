@@ -1036,9 +1036,10 @@ def search(
         # single SQLite write lock under sustained pi-claim/ingest load, blocking this
         # read-mostly search for 8-14s. Telemetry must never sit on the hot path.
         from mayring_core.memory.store import log_llm_call_async
+        from mayring_core.config import EMBEDDING_MODEL as _EMBED_MODEL
         log_llm_call_async(
             call_type="vector_search",
-            model=_os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
+            model=_EMBED_MODEL,
             prompt=query[:200],
             response=_json.dumps({"vector_stage": vector_diag}),
             tool_calls=0,

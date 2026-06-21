@@ -68,7 +68,28 @@ MAX_CONTEXT_CHARS = 6000  # ~500 tokens
 
 # RAG context (Phase 2: ChromaDB similarity search)
 RAG_TOP_K = 5                          # Number of similar context entries to inject
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")  # Ollama embedding model; env-switch to bge-m3 (multilingual) in prod
+def _central_embedding_model() -> str:
+    """SINGLE source of truth for the embedding model — resolve, don't hardcode.
+    Precedence: EMBEDDING_MODEL env (set centrally via GH-vars) → the 'embedding'
+    task in config/model_routes.yaml (the same file the ModelRouter reads) →
+    bge-m3 as the last-resort, which is the store's ACTUAL dimension (1024).
+    NEVER default to nomic: the store moved off nomic(768d) long ago, and a stray
+    nomic default silently loaded a 2nd embedder into VRAM (the week-old bug)."""
+    env = os.getenv("EMBEDDING_MODEL")
+    if env:
+        return env
+    try:
+        import yaml as _yaml
+        _data = _yaml.safe_load((BASE_DIR / "config" / "model_routes.yaml").read_text(encoding="utf-8"))
+        _model = ((_data or {}).get("embedding") or {}).get("model")
+        if _model:
+            return _model
+    except Exception:
+        pass
+    return "bge-m3"
+
+
+EMBEDDING_MODEL = _central_embedding_model()  # resolved from central model_routes.yaml; env overrides
 
 # Ollama
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))

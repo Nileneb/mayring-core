@@ -946,7 +946,7 @@ def _init_schema(conn: DBAdapter) -> None:
             summary             TEXT NOT NULL DEFAULT '',
             category_labels     TEXT NOT NULL DEFAULT '',
             category_version    TEXT NOT NULL DEFAULT 'mayring-inductive-v1',
-            embedding_model     TEXT NOT NULL DEFAULT 'nomic-embed-text',
+            embedding_model     TEXT NOT NULL DEFAULT 'bge-m3',
             embedding_id        TEXT NOT NULL DEFAULT '',
             quality_score       REAL NOT NULL DEFAULT 0.0,
             dedup_key           TEXT NOT NULL DEFAULT '',
