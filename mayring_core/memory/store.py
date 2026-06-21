@@ -185,7 +185,20 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       unpopulated hard chunks.project_id filter in retrieval._scope_filter in
 #       favour of a deterministic project_match boost (the chunks.project_id
 #       column stays DORMANT, not dropped). No backfill.
-CURRENT_SCHEMA_VERSION = 27  # v25: DROP legacy IGIO columns (igio-removal 2026-06-12); v26: embed-pool device cols (#365); v27: embed_jobs.is_audit (#365 house-audit)
+#   v25 (igio-removal 2026-06-12): DROP legacy IGIO columns.
+#   v26 (#365): embed-pool device cols.
+#   v27 (#365 house-audit): embed_jobs.is_audit.
+#   v28 (reference-doc-layer): sources.source_class column ('code'|'reference').
+#       Reference corpora (Unity docs) are default-excluded from retrieval. The
+#       ALTER backfills every existing row to 'code'; a follow-up UPDATE flips
+#       known reference prefixes (unity-docs:) to 'reference'. See spec
+#       2026-06-21-reference-doc-layer + 2026-06-21-retrieval-repo-scoping-hardfilter.
+CURRENT_SCHEMA_VERSION = 28  # v28: sources.source_class (reference-doc-layer)
+
+# Source-id prefixes whose chunks are external reference docs, not own code.
+# The v28 migration flips these to source_class='reference'. Extend when a new
+# reference corpus is ingested without the --reference flag.
+_REFERENCE_SOURCE_PREFIXES = ("unity-docs:",)
 
 # C1 (project-groups): kuratierte, dark-mode-taugliche Palette. EINE Definition —
 # Auto-Vergabe + Validierung (API) lesen hier; spätere Statusline (C2) liest die
@@ -256,6 +269,12 @@ def _migrate_schema(conn: DBAdapter) -> None:
             # dimension UNTER dem einen Workspace (User-Diagramm). NULL = kein
             # Projekt (workspace-global). Ersetzt fake-separate workspace_ids.
             ("project_id", "TEXT DEFAULT NULL"),
+            # source_class (v25, reference-doc-layer): inclusion-policy axis.
+            # ALTER ... DEFAULT 'code' backfills every existing row to 'code'
+            # automatically → SQL _scope_filter is consistent the moment this
+            # migration runs (no NULL/absent window). Reference rows get flipped
+            # by _migrate_reference_source_class below.
+            ("source_class", "TEXT NOT NULL DEFAULT 'code'"),
         ],
         "chunks": [
             ("workspace_id", "TEXT NOT NULL DEFAULT 'default'"),
@@ -360,6 +379,7 @@ def _migrate_schema(conn: DBAdapter) -> None:
     _migrate_rename_research_questions(conn)
     _migrate_visibility_check(conn)
     _drop_legacy_igio_columns(conn)
+    _migrate_reference_source_class(conn)
 
 
 def _drop_legacy_igio_columns(conn: DBAdapter) -> None:
@@ -372,6 +392,24 @@ def _drop_legacy_igio_columns(conn: DBAdapter) -> None:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
         except Exception:
             pass  # Spalte existiert nicht (neue DB) oder SQLite <3.35
+
+
+def _migrate_reference_source_class(conn: DBAdapter) -> None:
+    """Flip known external reference corpora to source_class='reference'.
+
+    The generic ALTER above defaults every row to 'code'. This idempotent
+    UPDATE marks the reference prefixes (Unity docs) so they get
+    default-excluded from retrieval. Runs only when the column exists.
+    """
+    if "source_class" not in conn.get_columns("sources"):
+        return
+    for prefix in _REFERENCE_SOURCE_PREFIXES:
+        conn.execute(
+            "UPDATE sources SET source_class = 'reference' "
+            "WHERE source_id LIKE ? AND source_class != 'reference'",
+            (prefix + "%",),
+        )
+    _maybe_commit(conn)
 
 
 def _migrate_rename_research_questions(conn: DBAdapter) -> None:
@@ -427,7 +465,8 @@ def _migrate_visibility_check(conn: DBAdapter) -> None:
                 visibility      TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private', 'org', 'public', 'user')),
                 org_id          TEXT DEFAULT NULL,
                 user_id         TEXT DEFAULT NULL,
-                scope_key       TEXT DEFAULT NULL
+                scope_key       TEXT DEFAULT NULL,
+                source_class    TEXT NOT NULL DEFAULT 'code'
             );
         """)
         legacy_cols = conn.get_columns("sources_legacy_visibility")
@@ -470,7 +509,8 @@ _SOURCES_DDL_V15 = """
         user_id         TEXT DEFAULT NULL,
         scope_key       TEXT DEFAULT NULL,
         workspace_id    TEXT NOT NULL DEFAULT 'default',
-        project_id      TEXT DEFAULT NULL
+        project_id      TEXT DEFAULT NULL,
+        source_class    TEXT NOT NULL DEFAULT 'code'
     );
 """
 
@@ -930,7 +970,8 @@ def _init_schema(conn: DBAdapter) -> None:
             visibility      TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('private', 'org', 'public', 'user')),
             org_id          TEXT DEFAULT NULL,
             user_id         TEXT DEFAULT NULL,
-            scope_key       TEXT DEFAULT NULL
+            scope_key       TEXT DEFAULT NULL,
+            source_class    TEXT NOT NULL DEFAULT 'code'
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -1594,12 +1635,14 @@ def upsert_source(
             eff_user_id = workspace_owner(conn, workspace_id) or eff_user_id
         except Exception:  # noqa: BLE001 — owner lookup must never block ingest
             pass
+    eff_source_class = source.source_class or "code"
     conn.execute(
         """
         INSERT INTO sources
             (source_id, source_type, repo, path, branch, "commit", content_hash,
-             captured_at, workspace_id, visibility, org_id, user_id, scope_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             captured_at, workspace_id, visibility, org_id, user_id, scope_key,
+             source_class)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_id) DO UPDATE SET
             source_type  = excluded.source_type,
             repo         = excluded.repo,
@@ -1612,12 +1655,14 @@ def upsert_source(
             visibility   = excluded.visibility,
             org_id       = excluded.org_id,
             user_id      = excluded.user_id,
-            scope_key    = excluded.scope_key
+            scope_key    = excluded.scope_key,
+            source_class = excluded.source_class
         """,
         (
             source.source_id, source.source_type, source.repo, source.path,
             source.branch, source.commit, source.content_hash, source.captured_at,
             workspace_id, eff_visibility, eff_org_id, eff_user_id, eff_scope_key,
+            eff_source_class,
         ),
     )
     _maybe_commit(conn)
@@ -1642,6 +1687,8 @@ def get_source(conn: DBAdapter, source_id: str) -> Source | None:
         visibility=d.get("visibility") or "private",
         org_id=d.get("org_id"),
         user_id=d.get("user_id"),
+        scope_key=d.get("scope_key"),
+        source_class=d.get("source_class") or "code",
     )
 
 
