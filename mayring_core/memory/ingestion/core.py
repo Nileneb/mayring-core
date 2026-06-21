@@ -383,6 +383,16 @@ def ingest(
                                 "visibility": source.visibility,
                                 "org_id": source.org_id or "",
                                 "user_id": source.user_id or "",
+                                # WHY(repo-scoping-hardfilter): repo in the vector
+                                # index so build_chroma_where can hard-filter the
+                                # top-K to the scoped repo — without it, foreign
+                                # repos drown the candidate pool. Same raw value as
+                                # sources.repo so the SQL + vector stages agree.
+                                "repo": source.repo or "",
+                                # WHY(reference-doc-layer): inclusion axis in the
+                                # index so reference docs are default-excluded from
+                                # the vector top-K too (not just the SQL stage).
+                                "source_class": source.source_class or "code",
                             }],
                         )
                     indexed = True

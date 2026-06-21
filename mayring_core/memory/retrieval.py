@@ -118,17 +118,42 @@ def build_chroma_where(
     workspace_id: str | None,
     user_id: str | None,
     org_ids: tuple[str, ...] | list[str] | None,
+    repo: str | None = None,
+    include_reference: bool = False,
+    reference_only: bool = False,
 ) -> dict:
     """visibility-Disjunktion für die Chroma-Vektorsuche (Phase A); spiegelt _scope_filter,
     damit public/org-Chunks fremder Tenants als Vektor-Kandidaten zurückkommen. workspace_id
-    wird NICHT mehr als harter Filter genutzt."""
+    wird NICHT mehr als harter Filter genutzt.
+
+    Zusätzliche HARTE Filter (repo-scoping-hardfilter + reference-doc-layer):
+    - ``repo`` gesetzt → nur Chunks dieses Repos in den Vektor-Top-K (sonst
+      ertränken fremde Repos den Kandidaten-Pool; gemessen 2026-06-21).
+    - ``source_class`` per Default ``!= 'reference'`` (externe Dokus verrauschen
+      nie); ``include_reference`` hebt den Ausschluss auf, ``reference_only``
+      sucht NUR den Reference-Layer (/reference/search).
+    Korrektheit liegt ohnehin am SQL ``_scope_filter`` (die Vektor-Treffer werden
+    gegen dessen Kandidatenmenge geschnitten) — diese Where-Klauseln sorgen dafür,
+    dass die RICHTIGEN Chunks überhaupt Vektor-Scores bekommen.
+    """
     ors: list[dict] = [{"visibility": "public"}]
     if user_id:
         ors.append({"$and": [{"visibility": "private"}, {"user_id": user_id}]})
     cleaned = [o for o in (org_ids or ()) if o]
     if cleaned:
         ors.append({"$and": [{"visibility": "org"}, {"org_id": {"$in": list(cleaned)}}]})
-    return {"$or": ors} if len(ors) > 1 else ors[0]
+    visibility = {"$or": ors} if len(ors) > 1 else ors[0]
+
+    extra: list[dict] = []
+    if repo:
+        extra.append({"repo": repo})
+    if reference_only:
+        extra.append({"source_class": "reference"})
+    elif not include_reference:
+        extra.append({"source_class": {"$ne": "reference"}})
+    if not extra:
+        return visibility
+    return {"$and": [visibility, *extra]}
 
 
 def _scope_filter(
@@ -142,6 +167,8 @@ def _scope_filter(
     user_id: str | None = None,
     scope_key: str | None = None,
     project_id: str | None = None,
+    include_reference: bool = False,
+    reference_only: bool = False,
 ) -> list[str]:
     """Return chunk_ids of active chunks matching hard scope filters.
 
@@ -204,6 +231,30 @@ def _scope_filter(
         # papers, never another project's chunks in the same workspace.
         query += " AND s.scope_key = ?"
         params.append(scope_key)
+    # reference-doc-layer: source_class inclusion policy. reference_only =
+    # /reference/search (ONLY external docs). Default = exclude reference, UNLESS
+    # include_reference, OR the reference chunk is linked (chunk_project_links) to
+    # the active project_id ("Unity-Docs nur bei Battlefield"). This is the
+    # CORRECTNESS boundary — the vector hits get intersected with this set, so a
+    # reference doc can never leak into a normal query even before the Chroma
+    # metadata backfill lands.
+    if reference_only:
+        query += " AND s.source_class = 'reference'"
+    elif not include_reference:
+        if project_id:
+            query += (
+                " AND (s.source_class != 'reference'"
+                " OR c.chunk_id IN ("
+                "SELECT chunk_id FROM chunk_project_links"
+                " WHERE project_id = ?"
+                + (" AND workspace_id = ?" if workspace_id else "")
+                + "))"
+            )
+            params.append(project_id)
+            if workspace_id:
+                params.append(workspace_id)
+        else:
+            query += " AND s.source_class != 'reference'"
     # C3 v18: project scoping ist ein deterministischer Boost (_rerank, unten),
     # KEIN harter Filter — global/unverlinktes Wissen darf NIE versteckt werden.
     # Der frühere `AND c.project_id = ?`-Filter (chunks.project_id, unbefüllt)
@@ -876,6 +927,9 @@ def search(
     user_id: str | None = opts.get("user_id")
     scope_key: str | None = opts.get("scope_key")  # #252: e.g. "project:<id>"
     project_id: str | None = opts.get("project_id")  # #workspace-uuid-sot: Project-Dimension
+    # reference-doc-layer: opt-in for external reference docs (default-excluded).
+    include_reference: bool = bool(opts.get("include_reference", False))
+    reference_only: bool = bool(opts.get("reference_only", False))
 
     # Query-Cache check — hit: clone records, repopulate text on demand.
     # Bug history: cache used to store only (chunk_id, score_final), so
@@ -904,6 +958,7 @@ def search(
         conn, repo=repo, categories=categories, source_type=source_type,
         workspace_id=workspace_id, org_id=org_id, org_ids=org_ids,
         user_id=user_id, scope_key=scope_key, project_id=project_id,
+        include_reference=include_reference, reference_only=reference_only,
     )
 
     # Recency-Lane: den laufenden Session-Thread IMMER als Kandidat führen — auch
@@ -971,7 +1026,11 @@ def search(
                 vector_diag = f"chroma_empty(count={chroma_count})"
                 _log.warning("vector stage: chroma collection has 0 entries")
             else:
-                chroma_where = build_chroma_where(workspace_id, user_id, org_ids)
+                chroma_where = build_chroma_where(
+                    workspace_id, user_id, org_ids, repo=repo,
+                    include_reference=include_reference or bool(project_id),
+                    reference_only=reference_only,
+                )
                 results = None
                 try:
                     results = chroma_collection.query(

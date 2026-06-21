@@ -109,6 +109,42 @@ class TestChromaMetadataVisibility:
             assert meta["visibility"] == "org"
             assert meta["org_id"] == "org-x"
             assert meta["user_id"] == "u-7"
+            # repo-scoping-hardfilter + reference-doc-layer: repo + source_class
+            # must land in the vector index so build_chroma_where can hard-filter.
+            assert meta["repo"] == "owner/repo"
+            assert meta["source_class"] == "code"
+
+    def test_reference_source_class_in_chroma_metadata(self, monkeypatch, tmp_path):
+        """A reference source must carry source_class='reference' into Chroma."""
+        fake_emb = [0.1] * 384
+        import mayring_core.providers as _providers
+        monkeypatch.setattr(_providers, "embed_texts", lambda texts, url: [fake_emb] * len(texts))
+        import mayring_core.memory.ingestion.conversation_filter as _cf
+        monkeypatch.setattr(_cf, "should_skip_chunk", lambda text, stype: (False, ""))
+
+        db_conn = init_memory_db(tmp_path / "memory.db")
+        collection = _FakeCollection()
+        source = Source(
+            source_id="unity-docs:webgl/tier",
+            source_type="note",
+            repo="",
+            path="webgl/tier",
+            visibility="private",
+            user_id="u-7",
+            source_class="reference",
+        )
+        ingest(
+            source=source,
+            content="Unity WebGL tier reference documentation chunk.",
+            conn=db_conn,
+            chroma_collection=collection,
+            ollama_url="http://localhost:11434",
+            model="",
+            opts={"categorize": False},
+        )
+        assert collection.count() > 0
+        for meta in collection.last_metadatas:
+            assert meta["source_class"] == "reference"
 
     def test_none_org_id_becomes_empty_string(self, monkeypatch, tmp_path):
         """Chroma rejects None values — org_id/user_id=None must land as ''."""

@@ -88,6 +88,14 @@ class Source:
     # (paper, agent_result) — enforced at the /ingest boundary. Never store
     # an untyped value here; see SCOPE_KEY_RE.
     scope_key: str | None = None
+    # WHY(reference-doc-layer): inclusion-policy axis, ORTHOGONAL to source_type.
+    # "code" = own code/notes/conversations (default, always retrieved);
+    # "reference" = external docs (e.g. Unity 6.3 = 3495 chunks) that drowned
+    # every 3D/graphics query. Reference is DEFAULT-EXCLUDED in both retrieval
+    # stages and only surfaces via include_reference / /reference/search / a
+    # repo-scoped chunk_project_links eligibility. See spec
+    # 2026-06-21-reference-doc-layer.
+    source_class: str = "code"
 
     @staticmethod
     def make_id(repo: str, path: str) -> str:
@@ -113,6 +121,7 @@ class Source:
             "org_id": self.org_id,
             "user_id": self.user_id,
             "scope_key": self.scope_key,
+            "source_class": self.source_class,
         }
 
     @classmethod
@@ -121,6 +130,7 @@ class Source:
         data["org_id"] = d.get("org_id")  # None when absent or NULL
         data["user_id"] = d.get("user_id")
         data["scope_key"] = d.get("scope_key")  # None when absent or NULL
+        data["source_class"] = d.get("source_class") or "code"
         return cls(**data)
 
 
