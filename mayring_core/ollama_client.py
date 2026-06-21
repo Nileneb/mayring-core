@@ -38,13 +38,19 @@ _CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY", "")
 def _default_keep_alive():
     """Default keep_alive for LOCAL embed/generate calls.
 
-    WHY(VRAM-pin 2026-06-08): with the hot path consolidated to two small models
-    (bge-m3 embed ~0.65GB + qwen3.5-mayring:2b ~2GB = ~2.7GB, proven to coexist),
-    Ollama's default 5-min keep_alive still let each model evict the other under
-    concurrent embed+generate load → every call cold-loaded (2-17s) → /memory/search
-    + prompt-categorize blew the hook's 9s budget. Pinning both (keep_alive=-1) keeps
-    them resident. Override via OLLAMA_KEEP_ALIVE (-1=forever, "30m", 0=unload now)."""
-    v = os.getenv("OLLAMA_KEEP_ALIVE", "-1").strip()
+    WHY(VRAM-pin 2026-06-08): the hot path is two small models (bge-m3 embed +
+    qwen3.5-mayring:2b text); a 5-min keep_alive let them evict each other under
+    concurrent load → cold loads (2-17s) blew the hook's 9s budget.
+
+    WHY(deadlock 2026-06-21): keep_alive=-1 (forever) was the original fix but it
+    pins EVERY model called (incl. gemma/vision), and an un-evictable pin DEADLOCKS
+    Ollama's loader — a request for bge-m3 hung 30-60s+ while a -1-pinned qwen sat
+    resident (unloading qwen instantly fixed it). The GPU host now holds ≥3 models
+    concurrently (MAX_LOADED_MODELS), so a long FINITE keep_alive keeps the hot path
+    warm through active bursts WITHOUT an infinite pin that can wedge the loader.
+    Override via OLLAMA_KEEP_ALIVE ("30m", "-1"=forever (use only if you control
+    MAX_LOADED_MODELS), 0=unload now)."""
+    v = os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
     return -1 if v == "-1" else v
 
 
