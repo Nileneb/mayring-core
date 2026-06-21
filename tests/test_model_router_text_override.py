@@ -12,8 +12,14 @@ def test_text_override_file_wins_over_yaml(tmp_path, monkeypatch):
 
 def test_no_override_falls_back_to_yaml_default(tmp_path, monkeypatch):
     monkeypatch.setenv("MAYRING_CACHE_DIR", str(tmp_path))
-    r = ModelRouter(ollama_url="http://x")
-    assert r.resolve("text") != ""
+    # Hermetic: no model literal lives in code anymore (_DEFAULTS has no model names),
+    # so the fallback IS the yaml — pin it and assert resolve reads it.
+    import mayring_core.model_router as mr
+    cfg = tmp_path / "model_routes.yaml"
+    cfg.write_text("text:\n  model: mistral:7b-instruct\n  timeout: 240\n", encoding="utf-8")
+    monkeypatch.setattr(mr, "_CONFIG_PATH", cfg)
+    r = mr.ModelRouter(ollama_url="http://x")
+    assert r.resolve("text") == "mistral:7b-instruct"
 
 
 def test_empty_override_file_falls_back_to_yaml(tmp_path, monkeypatch):

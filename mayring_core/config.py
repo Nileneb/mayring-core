@@ -68,28 +68,40 @@ MAX_CONTEXT_CHARS = 6000  # ~500 tokens
 
 # RAG context (Phase 2: ChromaDB similarity search)
 RAG_TOP_K = 5                          # Number of similar context entries to inject
+_EMBED_MODEL_CACHE: str | None = None
+
+
 def _central_embedding_model() -> str:
-    """SINGLE source of truth for the embedding model — resolve, don't hardcode.
-    Precedence: EMBEDDING_MODEL env (set centrally via GH-vars) → the 'embedding'
-    task in config/model_routes.yaml (the same file the ModelRouter reads) →
-    bge-m3 as the last-resort, which is the store's ACTUAL dimension (1024).
-    NEVER default to nomic: the store moved off nomic(768d) long ago, and a stray
-    nomic default silently loaded a 2nd embedder into VRAM (the week-old bug)."""
+    """Resolve the embedding model from the SINGLE source of truth — NEVER a code
+    literal. Precedence: EMBEDDING_MODEL env (set centrally via GH-vars) → the
+    ModelRouter ('embedding' task in config/model_routes.yaml / central config).
+    Fails LOUD if nothing is configured: a missing model config is a deploy error,
+    not something to silently paper over with a stale hardcoded default — that exact
+    pattern (a leftover nomic literal) loaded a 2nd embedder into VRAM for a week.
+    Change models in ONE place (the yaml / GH-var); no code edit, ever."""
     env = os.getenv("EMBEDDING_MODEL")
     if env:
         return env
-    try:
-        import yaml as _yaml
-        _data = _yaml.safe_load((BASE_DIR / "config" / "model_routes.yaml").read_text(encoding="utf-8"))
-        _model = ((_data or {}).get("embedding") or {}).get("model")
-        if _model:
-            return _model
-    except Exception:
-        pass
-    return "bge-m3"
+    from mayring_core.model_router import ModelRouter
+    model = ModelRouter().resolve("embedding")
+    if not model:
+        raise RuntimeError(
+            "No embedding model configured. Set the 'embedding' task in "
+            "config/model_routes.yaml (or the EMBEDDING_MODEL env / central "
+            "model-config). There is NO hardcoded code default by design.")
+    return model
 
 
-EMBEDDING_MODEL = _central_embedding_model()  # resolved from central model_routes.yaml; env overrides
+def __getattr__(name: str):
+    # Lazy + cached: importing config never resolves a model (the library stays
+    # importable without a config present), and hot paths that do
+    # `from config import EMBEDDING_MODEL` don't re-construct the router each call.
+    if name == "EMBEDDING_MODEL":
+        global _EMBED_MODEL_CACHE
+        if _EMBED_MODEL_CACHE is None:
+            _EMBED_MODEL_CACHE = _central_embedding_model()
+        return _EMBED_MODEL_CACHE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Ollama
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "240"))

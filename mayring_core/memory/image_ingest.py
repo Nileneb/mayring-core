@@ -38,7 +38,7 @@ def discover_images(root: Path, max_file_bytes: int = 5 * 1024 * 1024, max_image
 def run_image_ingest(
     repo_url: str,
     ollama_url: str,
-    vision_model: str = "qwen2.5vl:3b",
+    vision_model: str | None = None,
     embed_model: str | None = None,
     max_images: int = 50,
     max_file_bytes: int = 5 * 1024 * 1024,
@@ -46,10 +46,13 @@ def run_image_ingest(
     workspace_id: str = "default",
 ) -> dict:
     """Shallow-clone repo, caption all images, ingest into memory."""
-    # Resolve the embedder from the single source of truth, never a nomic literal.
+    # Resolve embed/vision models from the single source of truth, never a literal.
     if embed_model is None:
         from mayring_core.config import EMBEDDING_MODEL
         embed_model = EMBEDDING_MODEL
+    if vision_model is None:
+        from mayring_core.model_router import ModelRouter
+        vision_model = ModelRouter(ollama_url).resolve("vision")
     url = repo_url.rstrip("/").removesuffix(".git")
     parts = url.split("github.com/", 1)
     repo_owner_name = parts[1] if len(parts) == 2 else url

@@ -32,7 +32,7 @@ def ingest_image(
     chroma_collection: Any,
     ollama_url: str,
     model: str,
-    vision_model: str = "qwen2.5vl:3b",
+    vision_model: str | None = None,
     workspace_id: str = "default",
 ) -> dict:
     """Ingest a single image file via vision captioning.
@@ -47,6 +47,9 @@ def ingest_image(
     """
     from mayring_core.providers import vision_caption as caption_image, vision_metadata as get_image_metadata
     from mayring_core.providers import embed_texts as _embed_texts
+    if vision_model is None:  # resolve from the single source, never a literal
+        from mayring_core.model_router import ModelRouter
+        vision_model = ModelRouter(ollama_url).resolve("vision")
     # Late import avoids circular dep core -> image -> core
     from mayring_core.memory.ingestion.core import resolve_dedup
     from mayring_core.memory.store import deactivate_chunks_by_source, get_source

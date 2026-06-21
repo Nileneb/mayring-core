@@ -25,12 +25,15 @@ except ImportError:
 from mayring_core.config import BASE_DIR as _ROOT  # depth-robust repo-root resolution (#267/#270)
 _CONFIG_PATH = _ROOT / "config" / "model_routes.yaml"
 
+# Model names live ONLY in config/model_routes.yaml (or the central model-config) —
+# NEVER hardcoded here. A model literal goes stale on the next model swap and silently
+# overrides the config (that was the nomic-embed VRAM bug: a leftover 768d default
+# beside the live bge-m3 store). _DEFAULTS carries STRUCTURE/timeouts only; resolve()
+# returns "" for a task with no configured model and embedding callers fail loud.
 _DEFAULTS: dict[str, dict] = {
-    "text":      {"model": "mistral:7b-instruct", "fallback": "qwen2.5-coder:7b", "timeout": 240},
-    "vision":    {"model": "qwen2.5vl:3b",        "fallback": "",                 "timeout": 120},
-    # bge-m3 (1024d) is the store's actual embedder. Was nomic-embed-text (768d) —
-    # a dead default that loaded a 2nd embedder into VRAM after the bge-m3 cutover.
-    "embedding": {"model": "bge-m3",              "fallback": "bge-m3",           "timeout": 60},
+    "text":      {"model": "", "fallback": "", "timeout": 240},
+    "vision":    {"model": "", "fallback": "", "timeout": 120},
+    "embedding": {"model": "", "fallback": "", "timeout": 60},
 }
 
 # Zentrale Modell-Konfig (app.linn.games /api/mcp/model-config) — Single-Source-of-
