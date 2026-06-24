@@ -498,13 +498,15 @@ def _assign_or_create(
 
     # echte Neu-Kategorie (ziel-gebunden gebildet) als 'proposed'; Embedding hinterlegen,
     # damit sie ab Promotion für cat_match matchbar ist + Folge-Runden dedupen.
-    from src.api.routes.codebooks import record_proposal  # late: web import cycle
+    from mayring_core import providers
     parent_hint_id = top_cat["id"] if top_cat is not None else None
-    # WHY(v19-drop-codebook): record_proposal-Signatur OHNE codebook_id (Controller passt
-    # die Definition in MayringCoder/src/api/routes/codebooks.py an).
-    cat_id = record_proposal(conn, candidate_label, paraphrase=task[:200],
-                             parent_hint_id=parent_hint_id,
-                             pi_job_id=pi_job_id, chunk_id=chunk_id, project_id=project_id)
+    # WHY(#267-di): recorder is host-side (writes codebook rows) — injected via the
+    # provider registry so core never imports src.api. Signature OHNE codebook_id
+    # (host definition in MayringCoder/src/api/routes/codebooks.py).
+    cat_id = providers.record_proposal(conn, candidate_label, paraphrase=task[:200],
+                                       parent_hint_id=parent_hint_id,
+                                       pi_job_id=pi_job_id, chunk_id=chunk_id,
+                                       project_id=project_id)
     emb_id = f"cb:proposed:{cat_id}"
     if chroma_categories is not None and candidate_emb:
         chroma_categories.upsert(ids=[emb_id], embeddings=[candidate_emb],

@@ -89,16 +89,10 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypat
     conn = _conn_with_one_active(tmp_path)
     chroma = _Chroma({"cb:1": [1.0, 0.0, 0.0]})
 
-    # Monkeypatch record_proposal mit der NEUEN Signatur (ohne codebook_id).
-    # Der Controller in MayringCoder/src/api/routes/codebooks.py passt die Definition an.
-    # WHY(core-standalone 2026-06-08): dieser Test prüft die CONSUMER-Integration
-    # (MayringCoder src/). Im core-eigenen CI existiert `src` nicht → sauber skippen
-    # statt hart zu failen; im Consumer (vendored) läuft er normal.
-    import pytest as _pytest
-    _codebooks_mod = _pytest.importorskip(
-        "src.api.routes.codebooks",
-        reason="consumer-only (MayringCoder src/) — skipped in core-standalone",
-    )
+    # Inject the host-side recorder via the provider registry (#267-di) instead of
+    # the old src.api.routes.codebooks back-import. monkeypatch on the module global
+    # auto-restores after the test — and this now runs in core-standalone too.
+    from mayring_core import providers
 
     def _fake_record_proposal(conn, candidate_label, *, paraphrase="",
                               parent_hint_id=None, pi_job_id="",
@@ -112,7 +106,7 @@ def test_mayring_reduce_inductive_half_creates_when_no_match(tmp_path, monkeypat
                            (candidate_label,)).fetchone()
         return row[0]
 
-    monkeypatch.setattr(_codebooks_mod, "record_proposal", _fake_record_proposal)
+    monkeypatch.setattr(providers, "_proposal_recorder_fn", _fake_record_proposal)
 
     # Kandidat-Embedding orthogonal zur Bestandskategorie → kein Treffer → neu
     res = mayring_reduce(
