@@ -1,5 +1,10 @@
 # mayring-core
 
+> **Ökosystem:** Teil des 4-Repo-MayringCoder-Systems (Layer 3 · Core/Ports).
+> Gesamtkarte: [`MayringCoder/ARCHITECTURE.md`](https://github.com/Nileneb/MayringCoder/blob/master/ARCHITECTURE.md).
+> Eingebunden als Git-Submodule `vendor/mayring-core`. Importiert **nie** `src.*` —
+> Host-Implementierungen kommen über `mayring_core.providers` (DI).
+
 Shared core library for the MayringCoder ecosystem: memory retrieval/ingestion,
 LLM routing, identity/workspace resolution, and the Ollama client.
 
