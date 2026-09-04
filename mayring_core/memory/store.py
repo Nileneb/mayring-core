@@ -193,7 +193,9 @@ def kv_invalidate_by_ids(chunk_ids: list[str]) -> None:
 #       ALTER backfills every existing row to 'code'; a follow-up UPDATE flips
 #       known reference prefixes (unity-docs:) to 'reference'. See spec
 #       2026-06-21-reference-doc-layer + 2026-06-21-retrieval-repo-scoping-hardfilter.
-CURRENT_SCHEMA_VERSION = 28  # v28: sources.source_class (reference-doc-layer)
+#   v29 (search-latency): chunks_fts (FTS5, external content) + sync-Trigger,
+#       plus die Composite-Indizes idx_chunks_ws_active / idx_sources_vis_user.
+CURRENT_SCHEMA_VERSION = 29  # v29: chunks_fts keyword index
 
 # Source-id prefixes whose chunks are external reference docs, not own code.
 # The v28 migration flips these to source_class='reference'. Extend when a new
@@ -929,6 +931,45 @@ def _migrate_embed_jobs_audit_col(conn: DBAdapter) -> None:
         conn.commit()
 
 
+def _migrate_chunks_fts(conn: DBAdapter) -> None:
+    """FTS5 keyword index over chunks.text/summary — migration v28->v29.
+
+    WHY(search-latency 2026-09-04): _scope_filter has no LIMIT, so on a
+    single-user workspace every search loaded and re-tokenised ALL ~8k active
+    chunks (20 MB) for the symbolic stage (~2,3 s prod). retrieval._fts_candidate_ids
+    caps the keyword lane at the top-N bm25 matches instead. external-content
+    (content='chunks') duplicates no text — only the inverted index.
+
+    Idempotent: the rebuild only runs when the table was just created (a rebuild
+    on every boot would re-index the whole corpus); triggers are IF NOT EXISTS.
+    """
+    existed = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+    ).fetchone())
+    conn.executescript("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            text, summary, content='chunks', content_rowid='rowid'
+        );
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, text, summary)
+            VALUES (new.rowid, new.text, new.summary);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text, summary)
+            VALUES ('delete', old.rowid, old.text, old.summary);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text, summary)
+            VALUES ('delete', old.rowid, old.text, old.summary);
+            INSERT INTO chunks_fts(rowid, text, summary)
+            VALUES (new.rowid, new.text, new.summary);
+        END;
+    """)
+    if not existed:
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+    conn.commit()
+
+
 def _init_schema(conn: DBAdapter) -> None:
     """Ensure all tables and indexes exist, with schema versioning to skip DDL when current.
 
@@ -1500,9 +1541,21 @@ def _init_schema(conn: DBAdapter) -> None:
         "ON categories(name) WHERE goal_id IS NULL"
     )
 
+    # v29 (search-latency): FTS5-Keyword-Index. NACH _migrate_schema, damit die
+    # Trigger auf der finalen chunks-Form sitzen (igio-DROP-COLUMN läuft dort).
+    _migrate_chunks_fts(conn)
+
     # Indexes for workspace_id filtering
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_chunks_workspace_id ON chunks(workspace_id)"
+    )
+    # v29: die beiden Hot-Path-Filter von _scope_filter (chunks-Seite + der
+    # visibility/user-Disjunktion auf sources).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_ws_active ON chunks(workspace_id, is_active)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sources_vis_user ON sources(visibility, user_id)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sources_workspace_id ON sources(workspace_id)"
@@ -1861,12 +1914,16 @@ def deactivate_chunks_by_source(
     conn: DBAdapter, source_id: str
 ) -> int:
     """Set is_active=0 for all active chunks of source_id. Returns count."""
-    conn.execute(
+    # WHY(v29): rowcount VOR dem Commit lesen. Die chunks_fts-Trigger schreiben
+    # ihren Index erst beim Commit, danach meldet changes() deren letzte Zeile (1)
+    # statt der deaktivierten Chunks.
+    cur = conn.execute(
         "UPDATE chunks SET is_active = 0 WHERE source_id = ? AND is_active = 1",
         (source_id,),
     )
+    deactivated = cur.rowcount
     _maybe_commit(conn)
-    return conn.changes()
+    return deactivated
 
 
 def update_chunk_category_labels(

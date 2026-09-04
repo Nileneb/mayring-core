@@ -284,6 +284,36 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
+_FTS_CANDIDATE_LIMIT = int(os.environ.get("MAYRING_FTS_CANDIDATE_LIMIT", "200"))
+
+
+def _fts_candidate_ids(
+    conn: DBAdapter, query_terms: set[str], limit: int = _FTS_CANDIDATE_LIMIT,
+) -> list[str]:
+    """Top-`limit` chunk_ids by bm25 for the query tokens (chunks_fts, schema v29).
+
+    WHY(search-latency): without this lane the symbolic stage ran over the WHOLE
+    scope (4,7k chunks / 20 MB text in prod → 0,55 s je Suche, gemessen
+    2026-09-04; mit Lane 0,04 s bei ~100 Kandidaten). Tokens come from _tokenize,
+    i.e. `[a-z0-9]+` only — no FTS5 syntax can be injected; each is still quoted
+    so tokens that collide with FTS keywords (and/or/not/near) stay literals.
+    """
+    if not query_terms:
+        return []
+    match = " OR ".join(f'"{t}"' for t in sorted(query_terms))
+    # WHY(bm25-plan): der JOIN MUSS hinter das LIMIT. In einer Query verbunden
+    # joint SQLite chunks für JEDEN Match und sortiert erst dann (1,1 s auf 17k
+    # Chunks); als Subquery kostet dieselbe Suche 2 ms.
+    rows = conn.execute(
+        "SELECT c.chunk_id FROM ("
+        "  SELECT rowid AS rid FROM chunks_fts WHERE chunks_fts MATCH ?"
+        "  ORDER BY bm25(chunks_fts) LIMIT ?"
+        ") f JOIN chunks c ON c.rowid = f.rid WHERE c.is_active = 1",
+        (match, limit),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 # WHY(2026-06-20 hook-latency): re-tokenising the full text+summary of EVERY
 # candidate on EVERY search dominated /memory/search latency (~3s for a 10k
 # candidate set). With a single-user prod workspace where ~all chunks are that
@@ -953,13 +983,27 @@ def search(
                 hydrated.append(_dc.replace(cached))
         return hydrated
 
-    # Stage 1: scope filter
-    candidate_ids = _scope_filter(
+    # Stage 1: scope filter — Isolation-Gate. Liefert IDs (kein Text) und bleibt
+    # damit die Menge, gegen die jeder Treffer (auch aus Chroma) geprüft wird.
+    scope_set = set(_scope_filter(
         conn, repo=repo, categories=categories, source_type=source_type,
         workspace_id=workspace_id, org_id=org_id, org_ids=org_ids,
         user_id=user_id, scope_key=scope_key, project_id=project_id,
         include_reference=include_reference, reference_only=reference_only,
-    )
+    ))
+
+    if not scope_set:
+        # Tell callers WHY the result is empty: scope filter excluded
+        # everything (workspace mismatch, no public/org/user share, etc.)
+        opts["_vector_diag"] = "empty_after_scope_filter"
+        return []
+
+    # Keyword-Lane: nur die besten bm25-Treffer werden Kandidaten, nicht der
+    # ganze Scope. Der Schnitt mit scope_set hält die Workspace-Isolation.
+    query_terms = _tokenize(query)
+    candidate_ids = [
+        cid for cid in _fts_candidate_ids(conn, query_terms) if cid in scope_set
+    ]
 
     # Recency-Lane: den laufenden Session-Thread IMMER als Kandidat führen — auch
     # wenn der scope-Filter (repo/project/source_type) ihn ausschließen würde. So
@@ -967,13 +1011,7 @@ def search(
     session_ids = _session_recency_ids(conn, workspace_id, opts.get("session_id"))
     if session_ids:
         _seen = set(candidate_ids)
-        candidate_ids = list(candidate_ids) + [s for s in session_ids if s not in _seen]
-
-    if not candidate_ids:
-        # Tell callers WHY the result is empty: scope filter excluded
-        # everything (workspace mismatch, no public/org/user share, etc.)
-        opts["_vector_diag"] = "empty_after_scope_filter"
-        return []
+        candidate_ids = candidate_ids + [s for s in session_ids if s not in _seen]
 
     # Load candidate chunks: KV cache first (fast in-mem hits), then ONE bulk
     # SQLite query for the misses. WHY(#workspace-uuid-sot perf): the old per-cid
@@ -993,12 +1031,8 @@ def search(
     if missing_ids:
         candidates.extend(get_chunks_bulk(conn, missing_ids))
 
-    if not candidates:
-        return []
-
     # Stage 2: symbolic scoring (optionally enriched with task_context tokens)
     task_context: str | None = opts.get("task_context")
-    query_terms = _tokenize(query)
     if task_context:
         # Task-context tokens widen recall — used for symbolic overlap only.
         # Each token still counts equally, so this won't dilute precision.
@@ -1051,7 +1085,10 @@ def search(
                 else:
                     ids_list = results.get("ids", [[]])[0]
                     dist_list = results.get("distances", [[]])[0]
-                candidate_set = {c.chunk_id for c in candidates}
+                # Der Scope (nicht die verkürzte Keyword-Kandidatenliste) ist das
+                # Isolations-Gate für Vektor-Treffer; Session-Chunks dürfen wie
+                # bisher auch außerhalb des Scopes einen Vektor-Score bekommen.
+                candidate_set = scope_set | set(session_ids)
                 vector_scores = _normalize_vector_scores(ids_list, dist_list, candidate_set)
                 max_score = max(vector_scores.values()) if vector_scores else 0.0
                 mean_dist = (sum(dist_list) / len(dist_list)) if dist_list else 0.0
@@ -1086,6 +1123,20 @@ def search(
             vector_diag = f"embed_failed:{type(exc).__name__}"
             _log.warning("vector retrieval failed (best-effort skip): %s", exc)
     opts["_vector_diag"] = vector_diag
+
+    # Vektor-Treffer, die die Keyword-Lane nicht gefunden hat, nachladen und
+    # symbolisch scoren — sonst wären sie nach dem Kandidaten-Cap unsichtbar.
+    # Sie sind bereits gegen candidate_set (scope) gefiltert.
+    extra_ids = [cid for cid in vector_scores if cid not in symbolic_scores]
+    if extra_ids:
+        extra_chunks = get_chunks_bulk(conn, extra_ids)
+        candidates.extend(extra_chunks)
+        symbolic_scores.update(
+            {c.chunk_id: _symbolic_score(c, query_terms) for c in extra_chunks}
+        )
+
+    if not candidates:
+        return []
 
     # Telemetry: persist vector-stage outcome to llm_calls_log so the
     # dashboard can plot success-rate over time. Reuses the existing
